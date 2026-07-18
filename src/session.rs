@@ -133,6 +133,13 @@ fn build_command(opts: &SpawnOpts) -> CommandBuilder {
     cmd
 }
 
+/// The reply to a cursor-position report request (DSR `CSI 6 n`): the terminal
+/// answers `CSI row;col R`, 1-based. `row`/`col` are the emulator's 0-based
+/// cursor position.
+fn cursor_position_report(row: u16, col: u16) -> String {
+    format!("\x1b[{};{}R", row + 1, col + 1)
+}
+
 impl PtySession {
     pub fn spawn(opts: &SpawnOpts) -> Result<Self> {
         let pty_system = portable_pty::native_pty_system();
@@ -184,6 +191,24 @@ impl PtySession {
                         if !reply.is_empty() {
                             let mut w = writer_for_thread.lock();
                             let _ = w.write_all(&reply);
+                            let _ = w.flush();
+                        }
+                        // Answer a cursor-position report request (DSR `CSI 6 n`)
+                        // with the emulator's current cursor. Without this, ConPTY
+                        // on Windows (created with PSEUDOCONSOLE_INHERIT_CURSOR)
+                        // blocks at startup and no interactive program ever renders.
+                        //
+                        // The position is read before this chunk is processed, so a
+                        // DSR arriving mid-chunk (after cursor movement in the same
+                        // read) is answered with the pre-chunk position. That is exact
+                        // for the ConPTY startup handshake, where the DSR is the first
+                        // output, and only imprecise for a program that moves the
+                        // cursor and queries within a single write burst.
+                        if detector.take_cursor_report_request() {
+                            let (row, col) = parser_for_thread.lock().screen().cursor_position();
+                            let resp = cursor_position_report(row, col);
+                            let mut w = writer_for_thread.lock();
+                            let _ = w.write_all(resp.as_bytes());
                             let _ = w.flush();
                         }
                         parser_for_thread.lock().process(&buf[..n]);
@@ -598,4 +623,56 @@ pub struct SessionInfo {
     pub cmdline: String,
     pub cwd: String,
     pub status: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_report_is_one_based_row_then_col() {
+        // DSR reply is `CSI row;col R`, 1-based, row before col.
+        assert_eq!(cursor_position_report(0, 0), "\x1b[1;1R");
+        assert_eq!(cursor_position_report(24, 79), "\x1b[25;80R");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_pty_tests {
+    use super::*;
+
+    /// Regression test for issue #2: interactive pty mode was broken on native
+    /// Windows because ConPTY (created with `PSEUDOCONSOLE_INHERIT_CURSOR`)
+    /// blocks until its startup cursor-position DSR (`CSI 6 n`) is answered.
+    /// `cmd.exe` must render its prompt once the reader answers that DSR.
+    #[test]
+    fn interactive_cmd_renders_under_pty() {
+        let opts = SpawnOpts {
+            command: "cmd.exe".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 25,
+            buffer_bytes: 0,
+        };
+        let mut session = PtySession::spawn(&opts).expect("spawn cmd.exe under pty");
+
+        // Poll for up to ~5s; in practice the prompt appears within ~200ms.
+        let mut rendered = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let dump = session.dump(ScreenFormat::Text);
+            if !dump.text.trim().is_empty() {
+                rendered = dump.text;
+                break;
+            }
+        }
+        session.kill();
+
+        assert!(
+            !rendered.trim().is_empty(),
+            "cmd.exe never rendered under pty — ConPTY cursor DSR likely unanswered (issue #2)"
+        );
+    }
 }
