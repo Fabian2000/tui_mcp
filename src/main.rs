@@ -137,14 +137,12 @@ struct MouseArgs {
     action: Option<String>,
     #[serde(default)]
     modifiers: Vec<String>,
-    /// Repeat the whole action this many times in one call. Use count=2 for a
-    /// double-click, count=3 for a triple-click (or to scroll several notches).
-    /// Default 1.
+    /// Repeat the whole action this many times in one call (count=2
+    /// double-click, 3 triple). Default 1.
     #[serde(default)]
     count: Option<u32>,
-    /// Delay in milliseconds between the repeats (only when count > 1). Omit or
-    /// 0 for a zero-gap burst, which is what registers as a double-click. A
-    /// non-zero delay produces that many DISTINCT clicks instead.
+    /// Gap in ms between repeats (only when count > 1). Omit/0 for a zero-gap
+    /// burst (double-click); non-zero spaces them into distinct events.
     #[serde(default)]
     delay_ms: Option<u64>,
 }
