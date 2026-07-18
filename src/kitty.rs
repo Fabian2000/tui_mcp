@@ -28,6 +28,8 @@ pub struct KittyDetector {
     buf: Vec<u8>,
     in_csi: bool,
     saw_esc: bool,
+    /// A cursor-position report (CPR, `CSI 6 n`) was requested and not yet answered.
+    cpr_requested: bool,
 }
 
 impl KittyDetector {
@@ -38,7 +40,20 @@ impl KittyDetector {
             buf: Vec::new(),
             in_csi: false,
             saw_esc: false,
+            cpr_requested: false,
         }
+    }
+
+    /// Whether a cursor-position report (DSR `CSI 6 n`) was requested since the
+    /// last check, clearing the flag. The caller answers with the emulator's
+    /// current cursor because only it knows the position.
+    ///
+    /// This matters on Windows: ConPTY is created with
+    /// `PSEUDOCONSOLE_INHERIT_CURSOR`, so conhost emits `CSI 6 n` at startup and
+    /// blocks its whole initialisation until the driving terminal replies. Never
+    /// answering it leaves every interactive program frozen with a blank screen.
+    pub fn take_cursor_report_request(&mut self) -> bool {
+        std::mem::take(&mut self.cpr_requested)
     }
 
     /// Feed a chunk of program output. Returns bytes that must be written back
@@ -84,6 +99,14 @@ impl KittyDetector {
             if body.first() == Some(&b'?') && body[1..].split(|&c| c == b';').any(|p| p == b"2004")
             {
                 self.paste.store(final_b == b'h', Ordering::Relaxed);
+            }
+            return;
+        }
+        // Cursor-position report request: DSR `CSI 6 n` (or private `CSI ? 6 n`).
+        // We only flag it here; the reader thread answers with the real cursor.
+        if final_b == b'n' {
+            if body == b"6" || body == b"?6" {
+                self.cpr_requested = true;
             }
             return;
         }
@@ -183,6 +206,40 @@ mod tests {
         let (mut d, flags, _paste) = detector();
         d.feed(b"hello \x1b[2J world \x1b[1;5H");
         assert_eq!(flags.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cursor_position_report_is_flagged() {
+        let (mut d, _flags, _paste) = detector();
+        assert!(d.feed(b"\x1b[6n").is_empty());
+        assert!(d.take_cursor_report_request());
+        // The flag is one-shot: a second check sees nothing.
+        assert!(!d.take_cursor_report_request());
+    }
+
+    #[test]
+    fn cursor_position_report_split_across_feeds() {
+        let (mut d, _flags, _paste) = detector();
+        d.feed(b"\x1b[");
+        d.feed(b"6");
+        d.feed(b"n");
+        assert!(d.take_cursor_report_request());
+    }
+
+    #[test]
+    fn private_cursor_position_report_is_flagged() {
+        // ConPTY may send the private form `CSI ? 6 n`.
+        let (mut d, _flags, _paste) = detector();
+        d.feed(b"\x1b[?6n");
+        assert!(d.take_cursor_report_request());
+    }
+
+    #[test]
+    fn unrelated_dsr_is_ignored() {
+        let (mut d, _flags, _paste) = detector();
+        // Device-attributes-ish `CSI 5 n` is not a cursor report.
+        d.feed(b"\x1b[5n");
+        assert!(!d.take_cursor_report_request());
     }
 
     #[test]

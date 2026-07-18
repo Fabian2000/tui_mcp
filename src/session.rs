@@ -133,6 +133,13 @@ fn build_command(opts: &SpawnOpts) -> CommandBuilder {
     cmd
 }
 
+/// The reply to a cursor-position report request (DSR `CSI 6 n`): the terminal
+/// answers `CSI row;col R`, 1-based. `row`/`col` are the emulator's 0-based
+/// cursor position.
+fn cursor_position_report(row: u16, col: u16) -> String {
+    format!("\x1b[{};{}R", row + 1, col + 1)
+}
+
 impl PtySession {
     pub fn spawn(opts: &SpawnOpts) -> Result<Self> {
         let pty_system = portable_pty::native_pty_system();
@@ -184,6 +191,24 @@ impl PtySession {
                         if !reply.is_empty() {
                             let mut w = writer_for_thread.lock();
                             let _ = w.write_all(&reply);
+                            let _ = w.flush();
+                        }
+                        // Answer a cursor-position report request (DSR `CSI 6 n`)
+                        // with the emulator's current cursor. Without this, ConPTY
+                        // on Windows (created with PSEUDOCONSOLE_INHERIT_CURSOR)
+                        // blocks at startup and no interactive program ever renders.
+                        //
+                        // The position is read before this chunk is processed, so a
+                        // DSR arriving mid-chunk (after cursor movement in the same
+                        // read) is answered with the pre-chunk position. That is exact
+                        // for the ConPTY startup handshake, where the DSR is the first
+                        // output, and only imprecise for a program that moves the
+                        // cursor and queries within a single write burst.
+                        if detector.take_cursor_report_request() {
+                            let (row, col) = parser_for_thread.lock().screen().cursor_position();
+                            let resp = cursor_position_report(row, col);
+                            let mut w = writer_for_thread.lock();
+                            let _ = w.write_all(resp.as_bytes());
                             let _ = w.flush();
                         }
                         parser_for_thread.lock().process(&buf[..n]);
@@ -598,4 +623,167 @@ pub struct SessionInfo {
     pub cmdline: String,
     pub cwd: String,
     pub status: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_report_is_one_based_row_then_col() {
+        // DSR reply is `CSI row;col R`, 1-based, row before col.
+        assert_eq!(cursor_position_report(0, 0), "\x1b[1;1R");
+        assert_eq!(cursor_position_report(24, 79), "\x1b[25;80R");
+    }
+}
+
+/// Windows counterpart to `unix_pty_tests`: the same pty behavior, verified
+/// through a native Windows harness (ConPTY + cmd.exe) instead of bash.
+#[cfg(all(test, windows))]
+mod windows_pty_tests {
+    use super::*;
+
+    /// Regression test for issue #2: interactive pty mode was broken on native
+    /// Windows because ConPTY (created with `PSEUDOCONSOLE_INHERIT_CURSOR`)
+    /// blocks until its startup cursor-position DSR (`CSI 6 n`) is answered.
+    /// `cmd.exe` must render its prompt once the reader answers that DSR.
+    #[test]
+    fn interactive_cmd_renders_under_pty() {
+        let opts = SpawnOpts {
+            command: "cmd.exe".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 25,
+            buffer_bytes: 0,
+        };
+        let mut session = PtySession::spawn(&opts).expect("spawn cmd.exe under pty");
+
+        // Poll for up to ~5s; in practice the prompt appears within ~200ms.
+        let mut rendered = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let dump = session.dump(ScreenFormat::Text);
+            if !dump.text.trim().is_empty() {
+                rendered = dump.text;
+                break;
+            }
+        }
+        session.kill();
+
+        assert!(
+            !rendered.trim().is_empty(),
+            "cmd.exe never rendered under pty — ConPTY cursor DSR likely unanswered (issue #2)"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_pty_tests {
+    use super::*;
+
+    /// Unix counterpart to `interactive_cmd_renders_under_pty`: a program that
+    /// emits a cursor-position request (DSR `CSI 6 n`) on its output must get
+    /// `CSI row;col R` back on its input. Answering it is what stops
+    /// prompt_toolkit REPLs (ptpython/IPython) from warning "terminal doesn't
+    /// support CPR" and laying out wrong — and it needs no such program to test.
+    ///
+    /// A tiny `bash` child switches its tty to raw mode (so its `read` returns
+    /// on the reply's `R` rather than waiting for a newline, and the reply
+    /// isn't echoed back), emits the DSR, reads the terminal's answer, and
+    /// prints it as printable text `CPR[row;col]`. `${rep#*[}` drops the
+    /// leading `ESC[`. If the reader thread never answers, `read` blocks
+    /// forever and the marker never appears (the pre-fix behavior).
+    #[test]
+    fn cpr_request_is_answered_over_pty() {
+        let script = r#"stty raw -echo; printf '\033[6n'; IFS= read -r -s -d R rep; printf 'CPR[%s]\n' "${rep#*[}""#;
+        let opts = SpawnOpts {
+            command: "bash".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 0,
+        };
+        let mut session = PtySession::spawn(&opts).expect("spawn bash under pty");
+
+        // Poll for up to ~3s; the round trip completes within a few ms.
+        let mut marker = String::new();
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let text = session.dump(ScreenFormat::Text).text;
+            if let Some(inside) = text
+                .split_once("CPR[")
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .map(|(inside, _)| inside.to_string())
+            {
+                marker = inside;
+                break;
+            }
+        }
+        session.kill();
+
+        // The child only prints after its `read` returns, so getting a
+        // well-formed `row;col` at all proves the DSR was answered. It never
+        // moved the cursor, so the emulator reports home (1;1, 1-based).
+        let (row, col) = marker.split_once(';').unwrap_or(("", ""));
+        assert!(
+            !row.is_empty()
+                && row.bytes().all(|b| b.is_ascii_digit())
+                && !col.is_empty()
+                && col.bytes().all(|b| b.is_ascii_digit()),
+            "expected the terminal to answer the cursor-position request with row;col, \
+             got marker {marker:?} — DSR likely unanswered"
+        );
+        assert_eq!(marker, "1;1", "cursor should report home before any output");
+    }
+
+    /// Stronger than the home-position test: it proves the reply carries the
+    /// *actual* cursor, not a hardcoded value. The child moves the cursor to a
+    /// known spot (`CSI 5;10 H`) and only then queries, so the answer must be
+    /// `5;10`; a constant `1;1` reply (ignoring the real cursor) would fail.
+    ///
+    /// The move and the query are sent as two writes with a gap between them.
+    /// The reader thread reads the cursor position *before* applying the
+    /// current chunk (see `PtySession::spawn`), so the move must land in an
+    /// earlier read than the query — otherwise the answer would reflect the
+    /// pre-move (home) position. The `sleep` forces that separation.
+    #[test]
+    fn cpr_reports_the_actual_cursor_position() {
+        let script = r#"stty raw -echo; printf '\033[5;10H'; sleep 0.1; printf '\033[6n'; IFS= read -r -s -d R rep; printf 'CPR[%s]\n' "${rep#*[}""#;
+        let opts = SpawnOpts {
+            command: "bash".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 0,
+        };
+        let mut session = PtySession::spawn(&opts).expect("spawn bash under pty");
+
+        let mut marker = String::new();
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let text = session.dump(ScreenFormat::Text).text;
+            if let Some(inside) = text
+                .split_once("CPR[")
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .map(|(inside, _)| inside.to_string())
+            {
+                marker = inside;
+                break;
+            }
+        }
+        session.kill();
+
+        // CSI 5;10 H put the cursor at row 5, col 10 (1-based), so the DSR
+        // answer must report exactly that.
+        assert_eq!(
+            marker, "5;10",
+            "cursor-position report did not reflect the real cursor (CSI 5;10 H)"
+        );
+    }
 }
