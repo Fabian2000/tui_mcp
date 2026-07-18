@@ -137,6 +137,14 @@ struct MouseArgs {
     action: Option<String>,
     #[serde(default)]
     modifiers: Vec<String>,
+    /// Repeat the whole action this many times in one call (count=2
+    /// double-click, 3 triple). Default 1.
+    #[serde(default)]
+    count: Option<u32>,
+    /// Gap in ms between repeats (only when count > 1). Omit/0 for a zero-gap
+    /// burst (double-click); non-zero spaces them into distinct events.
+    #[serde(default)]
+    delay_ms: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -643,8 +651,11 @@ impl TuiServer {
 
     #[tool(
         description = "Simulate a mouse event at 1-based (x, y). Actions: left, right, \
-        middle, scroll_up, scroll_down, down, up, move/drag, hover. The program must \
-        have mouse reporting enabled (most full-screen TUIs do)."
+        middle, scroll_up, scroll_down, down, up, move/drag, hover. Set count=2 for a \
+        double-click (count=3 triple); the repeats are written back-to-back with no delay, \
+        which is what a program reads as a double-click. delay_ms spaces the repeats apart \
+        if you want distinct clicks instead. The program must have mouse reporting enabled \
+        (most full-screen TUIs do)."
     )]
     async fn send_mouse(
         &self,
@@ -655,16 +666,43 @@ impl TuiServer {
             McpError::invalid_params(format!("unknown mouse action '{action_name}'"), None)
         })?;
         let mods = Mods::from_list(&a.modifiers);
+        let count = a.count.unwrap_or(1).max(1);
+        let delay = a.delay_ms.unwrap_or(0);
         let seqs = action_to_bytes(action, a.x, a.y, mods);
-        self.sessions
-            .with(&a.name, |s| {
-                for seq in &seqs {
-                    write_session(s, seq)?;
+        // Mirrors send_keys: with no delay, write every cycle under a single lock
+        // hold so the burst can't be interleaved by another tool call (a
+        // double-click stays contiguous). With a delay we re-acquire per cycle,
+        // since the lock can't be held across the await between cycles.
+        if delay == 0 {
+            self.sessions
+                .with(&a.name, |s| {
+                    for _ in 0..count {
+                        for seq in &seqs {
+                            write_session(s, seq)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(|e| err(&e))?;
+        } else {
+            for i in 0..count {
+                self.sessions
+                    .with(&a.name, |s| {
+                        for seq in &seqs {
+                            write_session(s, seq)?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| err(&e))?;
+                if i + 1 < count {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
-                Ok(())
-            })
-            .map_err(|e| err(&e))?;
-        Ok(reply(format!("mouse '{action_name}' at ({},{})", a.x, a.y)))
+            }
+        }
+        Ok(reply(format!(
+            "mouse '{action_name}' x{count} at ({},{})",
+            a.x, a.y
+        )))
     }
 
     #[tool(
@@ -1144,5 +1182,177 @@ mod tests {
         assert!(matches!(screen_format(Some("ansi")), ScreenFormat::Ansi));
         assert!(matches!(screen_format(Some("text")), ScreenFormat::Text));
         assert!(matches!(screen_format(None), ScreenFormat::Text));
+    }
+
+    /// `send_mouse` with `count: 2` must emit the click's byte sequence twice in
+    /// a single call (the zero-gap double-click). We verify it by echoing the
+    /// bytes back through a piped `cat`. Unix-only: relies on `cat` (which copies
+    /// stdin to stdout immediately, via a raw read/write loop with no stdio
+    /// buffering) and on a pipe not adding terminal echo of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_mouse_count_repeats_the_click() {
+        let srv = TuiServer::new();
+        srv.session_start(Parameters(StartArgs {
+            name: "catsess".into(),
+            command: "cat".into(),
+            args: vec![],
+            cwd: None,
+            env: HashMap::new(),
+            cols: None,
+            rows: None,
+            mode: Some("piped".into()),
+            buffer_bytes: None,
+        }))
+        .await
+        .unwrap();
+
+        srv.send_mouse(Parameters(MouseArgs {
+            name: "catsess".into(),
+            x: 3,
+            y: 4,
+            action: Some("left".into()),
+            modifiers: vec![],
+            count: Some(2),
+            delay_ms: None,
+        }))
+        .await
+        .unwrap();
+
+        // Close stdin so cat sees EOF and exits (cat echoes each write promptly;
+        // this is for a clean exit, not to flush).
+        srv.close_stdin(Parameters(NameArg {
+            name: "catsess".into(),
+        }))
+        .await
+        .unwrap();
+
+        // A left click is press (M) + release (m); count=2 doubles it. Poll the
+        // echoed output until the reader thread has drained the pipe.
+        let cycle = "\x1b[<0;3;4M\x1b[<0;3;4m";
+        let mut out = String::new();
+        for _ in 0..40 {
+            out = srv
+                .sessions
+                .with("catsess", |s| match s {
+                    Session::Piped(p) => Ok(p.read_stream(Stream::Stdout, false)),
+                    Session::Pty(_) => unreachable!("started as piped"),
+                })
+                .unwrap();
+            if out.matches(cycle).count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(out, format!("{cycle}{cycle}"));
+
+        srv.sessions.remove("catsess").ok();
+    }
+
+    /// With a non-zero `delay_ms`, `send_mouse` must emit the first click cycle,
+    /// pause, then emit the second — not both at once. We drive the future only
+    /// partway by racing it against a shorter timer through a pinned `&mut`
+    /// (which does NOT cancel it, unlike a plain moved future), observe that
+    /// `cat` has echoed just the first cycle, then await it to completion and
+    /// confirm the second arrives. Unix-only, same reasons as the count test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_mouse_delay_spaces_the_cycles() {
+        let srv = TuiServer::new();
+        srv.session_start(Parameters(StartArgs {
+            name: "catsess".into(),
+            command: "cat".into(),
+            args: vec![],
+            cwd: None,
+            env: HashMap::new(),
+            cols: None,
+            rows: None,
+            mode: Some("piped".into()),
+            buffer_bytes: None,
+        }))
+        .await
+        .unwrap();
+
+        let read_stdout = || {
+            srv.sessions
+                .with("catsess", |s| match s {
+                    Session::Piped(p) => Ok(p.read_stream(Stream::Stdout, false)),
+                    Session::Pty(_) => unreachable!("started as piped"),
+                })
+                .unwrap()
+        };
+
+        let cycle = "\x1b[<0;3;4M\x1b[<0;3;4m";
+
+        // A future is lazy: nothing runs until it is polled.
+        let fut = srv.send_mouse(Parameters(MouseArgs {
+            name: "catsess".into(),
+            x: 3,
+            y: 4,
+            action: Some("left".into()),
+            modifiers: vec![],
+            count: Some(2),
+            delay_ms: Some(30),
+        }));
+        tokio::pin!(fut);
+
+        // Poll the future once by racing it against a timer shorter than the
+        // delay. The pinned `&mut` means it is NOT dropped when the timer wins:
+        // it has written the first cycle and is now parked on its delay sleep.
+        // `biased` with the timer first: if a scheduling stall lets both
+        // deadlines pass at once, the (necessarily also-ready) timer is polled
+        // first, so a correct impl never trips the panic. The panic still fires
+        // for a broken delay path that finishes synchronously before the timer.
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            _ = &mut fut => panic!("send_mouse returned before its inter-click delay elapsed"),
+        }
+
+        // Wait for cat to finish echoing the first cycle (it can arrive in two
+        // reads: press, then release). This relies on cat echoing promptly with
+        // no stdio buffering, since stdin is still open here. The loop condition
+        // is the weak `contains` on purpose, so the equality assert below is an
+        // INDEPENDENT check — proving the buffer holds exactly one cycle and
+        // nothing more, not just re-stating the loop's own exit condition. A
+        // second cycle cannot appear here: the future is parked, nothing drives it.
+        let mut mid = String::new();
+        let mut echoed = false;
+        for _ in 0..20 {
+            mid = read_stdout();
+            if mid.contains(cycle) {
+                echoed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            echoed,
+            "timed out waiting for the first click cycle to be echoed"
+        );
+        assert_eq!(
+            mid, cycle,
+            "exactly one click cycle must be present mid-delay, got {mid:?}"
+        );
+
+        // Drive the rest: MouseArgs's delay elapses and the second cycle is sent.
+        fut.await.unwrap();
+        srv.close_stdin(Parameters(NameArg {
+            name: "catsess".into(),
+        }))
+        .await
+        .unwrap();
+
+        let mut out = String::new();
+        for _ in 0..40 {
+            out = read_stdout();
+            if out.matches(cycle).count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(out, format!("{cycle}{cycle}"));
+
+        srv.sessions.remove("catsess").ok();
     }
 }
