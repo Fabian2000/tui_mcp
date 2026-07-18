@@ -72,7 +72,7 @@ Check your client's own documentation for the exact location and format.
 | `send_text` | Type literal text (optional `delay_ms` to pace characters). |
 | `paste` | Paste multi-line text. Wraps in bracketed-paste markers when the program enabled the mode. |
 | `send_bytes` | Raw bytes with `\n \r \t \e \xHH` escapes, for anything the key and mouse tools don't cover. |
-| `send_mouse` | Click, scroll, drag, or hover at 1-based `(x, y)` (SGR mouse reporting). |
+| `send_mouse` | Click, scroll, drag, or hover at 1-based `(x, y)` (SGR mouse reporting). `count` repeats the action (`count: 2` = double-click); `delay_ms` spaces the repeats. |
 | `read_screen` | Dump the pty screen as text or ANSI, with size and cursor. Preferred and cheapest. |
 | `screenshot` | PNG of the pty screen for color and layout checks. Costlier, so use it only when colors matter. |
 | `read_scrollback` | Paged scrollback history (visible plus scrolled-off lines) with line numbers. |
