@@ -1099,6 +1099,17 @@ impl rmcp::ServerHandler for TuiServer {
     }
 }
 
+// `help_text()` interpolates these optional Cargo fields; fail the build if a
+// fork drops them rather than silently emitting a dangling label at runtime.
+const _: () = assert!(
+    !env!("CARGO_PKG_DESCRIPTION").is_empty(),
+    "set `description` in Cargo.toml (used in --help output)"
+);
+const _: () = assert!(
+    !env!("CARGO_PKG_REPOSITORY").is_empty(),
+    "set `repository` in Cargo.toml (used in --help output)"
+);
+
 /// `$name $version`, e.g. `tui_mcp 1.1.0`. Sourced from Cargo so it always
 /// matches the crate metadata (and the `serverInfo` the server reports).
 fn version_line() -> String {
@@ -1136,24 +1147,30 @@ enum CliAction {
 }
 
 /// Decide what to do from the argv tail (everything after the program name).
-/// Only the first argument is significant. Returns the action to take, or an
-/// `Err` holding a ready-to-print usage-error message. Kept pure (no I/O, no
-/// exit) so it can be unit-tested.
+/// The recognized flags take no further arguments, so anything trailing one is
+/// rejected — that keeps the syntax reserved should a flag gain arguments (or a
+/// subcommand appear) later. Returns the action, or an `Err` holding a
+/// ready-to-print usage message. Pure (no I/O, no exit) so it can be unit-tested.
 fn parse_cli_args<I, S>(args: I) -> Result<CliAction, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    match args.into_iter().next() {
-        None => Ok(CliAction::RunServer),
-        Some(arg) => match arg.as_ref() {
-            "--version" | "-V" => Ok(CliAction::ShowVersion),
-            "--help" | "-h" => Ok(CliAction::ShowHelp),
-            other => Err(format!(
-                "unknown argument: {other}\nTry '{} --help'.",
-                env!("CARGO_PKG_NAME")
-            )),
-        },
+    /// Prefix a usage error with the standard "try --help" hint.
+    fn usage(msg: impl std::fmt::Display) -> String {
+        format!("{msg}\nTry '{} --help'.", env!("CARGO_PKG_NAME"))
+    }
+
+    let owned: Vec<S> = args.into_iter().collect();
+    let args: Vec<&str> = owned.iter().map(|s| s.as_ref()).collect();
+    match args.as_slice() {
+        [] => Ok(CliAction::RunServer),
+        ["--version" | "-V"] => Ok(CliAction::ShowVersion),
+        ["--help" | "-h"] => Ok(CliAction::ShowHelp),
+        [flag @ ("--version" | "-V" | "--help" | "-h"), extra, ..] => Err(usage(format!(
+            "unexpected argument '{extra}' after '{flag}'"
+        ))),
+        [other, ..] => Err(usage(format!("unknown argument: {other}"))),
     }
 }
 
@@ -1247,6 +1264,19 @@ mod tests {
         let err = parse_cli_args(["--nope"]).unwrap_err();
         assert!(err.contains("unknown argument"));
         assert!(err.contains("--nope"));
+    }
+
+    #[test]
+    fn trailing_arg_after_flag_is_error() {
+        let err = parse_cli_args(["--version", "extra"]).unwrap_err();
+        assert!(err.contains("unexpected argument"));
+        assert!(err.contains("extra"));
+        // Also rejected after --help.
+        assert!(
+            parse_cli_args(["--help", "junk"])
+                .unwrap_err()
+                .contains("unexpected argument")
+        );
     }
 
     // --- CLI output text (built directly, independent of classification) ---
