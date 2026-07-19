@@ -1099,8 +1099,101 @@ impl rmcp::ServerHandler for TuiServer {
     }
 }
 
+// `help_text()` interpolates these optional Cargo fields; fail the build if a
+// fork drops them rather than silently emitting a dangling label at runtime.
+const _: () = assert!(
+    !env!("CARGO_PKG_DESCRIPTION").is_empty(),
+    "set `description` in Cargo.toml (used in --help output)"
+);
+const _: () = assert!(
+    !env!("CARGO_PKG_REPOSITORY").is_empty(),
+    "set `repository` in Cargo.toml (used in --help output)"
+);
+
+/// `$name $version`, e.g. `tui_mcp 1.1.0`. Sourced from Cargo so it always
+/// matches the crate metadata (and the `serverInfo` the server reports).
+fn version_line() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+fn help_text() -> String {
+    format!(
+        "{name} {version}\n\
+         {desc}\n\n\
+         USAGE:\n    {name} [OPTIONS]\n\n\
+         OPTIONS:\n    \
+         -h, --help       Print this help and exit\n    \
+         -V, --version    Print version and exit\n\n\
+         With no options, runs the MCP server over stdio: JSON-RPC on stdin/stdout,\n\
+         logs on stderr.\n\
+         Repository: {repo}",
+        name = env!("CARGO_PKG_NAME"),
+        version = env!("CARGO_PKG_VERSION"),
+        desc = env!("CARGO_PKG_DESCRIPTION"),
+        repo = env!("CARGO_PKG_REPOSITORY"),
+    )
+}
+
+/// What the top-level CLI arguments ask the process to do. Every variant is a
+/// normal (exit-0) outcome; a usage error is the `Err` side of the parse result.
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    /// No recognized flag: start the MCP server (the default).
+    RunServer,
+    /// Print the version line to stdout, then exit.
+    ShowVersion,
+    /// Print the help text to stdout, then exit.
+    ShowHelp,
+}
+
+/// Decide what to do from the argv tail (everything after the program name).
+/// The recognized flags take no further arguments, so anything trailing one is
+/// rejected — that keeps the syntax reserved should a flag gain arguments (or a
+/// subcommand appear) later. Returns the action, or an `Err` holding a
+/// ready-to-print usage message. Pure (no I/O, no exit) so it can be unit-tested.
+fn parse_cli_args<I, S>(args: I) -> Result<CliAction, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    /// Prefix a usage error with the standard "try --help" hint.
+    fn usage(msg: impl std::fmt::Display) -> String {
+        format!("{msg}\nTry '{} --help'.", env!("CARGO_PKG_NAME"))
+    }
+
+    let owned: Vec<S> = args.into_iter().collect();
+    let args: Vec<&str> = owned.iter().map(|s| s.as_ref()).collect();
+    match args.as_slice() {
+        [] => Ok(CliAction::RunServer),
+        ["--version" | "-V"] => Ok(CliAction::ShowVersion),
+        ["--help" | "-h"] => Ok(CliAction::ShowHelp),
+        [flag @ ("--version" | "-V" | "--help" | "-h"), extra, ..] => Err(usage(format!(
+            "unexpected argument '{extra}' after '{flag}'"
+        ))),
+        [other, ..] => Err(usage(format!("unknown argument: {other}"))),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Handle CLI flags before touching stdio, so `--version`/`--help` print and
+    // exit instead of blocking in the JSON-RPC loop waiting for a client.
+    match parse_cli_args(std::env::args().skip(1)) {
+        Ok(CliAction::ShowVersion) => {
+            println!("{}", version_line());
+            return Ok(());
+        }
+        Ok(CliAction::ShowHelp) => {
+            println!("{}", help_text());
+            return Ok(());
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+        Ok(CliAction::RunServer) => {}
+    }
+
     // Logs go to stderr so they don't corrupt the stdio MCP protocol on stdout.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -1144,5 +1237,62 @@ mod tests {
         assert!(matches!(screen_format(Some("ansi")), ScreenFormat::Ansi));
         assert!(matches!(screen_format(Some("text")), ScreenFormat::Text));
         assert!(matches!(screen_format(None), ScreenFormat::Text));
+    }
+
+    // --- CLI argument classification (pure `parse_cli_args`) ---
+
+    #[test]
+    fn no_args_runs_server() {
+        let empty: [&str; 0] = [];
+        assert_eq!(parse_cli_args(empty), Ok(CliAction::RunServer));
+    }
+
+    #[test]
+    fn version_flag_is_classified() {
+        assert_eq!(parse_cli_args(["--version"]), Ok(CliAction::ShowVersion));
+        assert_eq!(parse_cli_args(["-V"]), Ok(CliAction::ShowVersion));
+    }
+
+    #[test]
+    fn help_flag_is_classified() {
+        assert_eq!(parse_cli_args(["--help"]), Ok(CliAction::ShowHelp));
+        assert_eq!(parse_cli_args(["-h"]), Ok(CliAction::ShowHelp));
+    }
+
+    #[test]
+    fn unknown_arg_is_error() {
+        let err = parse_cli_args(["--nope"]).unwrap_err();
+        assert!(err.contains("unknown argument"));
+        assert!(err.contains("--nope"));
+    }
+
+    #[test]
+    fn trailing_arg_after_flag_is_error() {
+        let err = parse_cli_args(["--version", "extra"]).unwrap_err();
+        assert!(err.contains("unexpected argument"));
+        assert!(err.contains("extra"));
+        // Also rejected after --help.
+        assert!(
+            parse_cli_args(["--help", "junk"])
+                .unwrap_err()
+                .contains("unexpected argument")
+        );
+    }
+
+    // --- CLI output text (built directly, independent of classification) ---
+
+    #[test]
+    fn version_line_has_name_and_version() {
+        let v = version_line();
+        assert!(v.contains(env!("CARGO_PKG_NAME")));
+        assert!(v.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn help_text_has_usage_and_flags() {
+        let h = help_text();
+        assert!(h.contains("USAGE"));
+        assert!(h.contains("--help"));
+        assert!(h.contains("--version"));
     }
 }
