@@ -1090,6 +1090,7 @@ impl rmcp::ServerHandler for TuiServer {
             // report rmcp's own name/version (its `env!` runs in rmcp's crate), not ours.
             server_info: rmcp::model::Implementation {
                 name: env!("CARGO_PKG_NAME").to_owned(),
+                title: Some("TUI MCP".to_owned()),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 website_url: Some(env!("CARGO_PKG_REPOSITORY").to_owned()),
                 ..Default::default()
