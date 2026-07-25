@@ -100,6 +100,22 @@ pub struct ScreenDump {
     pub cols: u16,
 }
 
+impl ScreenDump {
+    /// Format the dump as a human-readable block with a leading status line.
+    /// Size is width x height. Cursor is x (column) and y (row), both 0-based.
+    pub fn render(&self) -> String {
+        format!(
+            "[size {}W x {}H] cursor=(x{}, y{}){}\n{}",
+            self.cols,
+            self.rows,
+            self.cursor_col,
+            self.cursor_row,
+            if self.cursor_hidden { " hidden" } else { "" },
+            self.text
+        )
+    }
+}
+
 /// Human-readable command line for display, e.g. `vim -u NONE "my file.txt"`.
 fn format_cmdline(opts: &SpawnOpts) -> String {
     let mut parts = vec![opts.command.clone()];

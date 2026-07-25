@@ -8,7 +8,9 @@ mod keys;
 mod kitty;
 mod mouse;
 mod render;
+mod schema;
 mod session;
+mod wait;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -24,6 +26,7 @@ use serde::Deserialize;
 use keys::{Mods, key_to_bytes, unescape};
 use mouse::{action_to_bytes, parse_action};
 use session::{ScreenFormat, Session, SessionManager, SpawnOpts, Stream};
+use wait::{POLL_INTERVAL_MS, WaitReturn, round_ms, sample_screen, wait_reply};
 
 // ---- Tool input schemas ----------------------------------------------------
 
@@ -187,6 +190,10 @@ struct WaitTextArgs {
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
+    /// default), or "ansi" (with color/attribute escapes).
+    #[serde(default)]
+    format: WaitReturn,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -195,6 +202,10 @@ struct WaitChangeArgs {
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
+    /// default), or "ansi" (with color/attribute escapes).
+    #[serde(default)]
+    format: WaitReturn,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -230,6 +241,10 @@ struct WaitStableArgs {
     /// Give up after this many ms (default 5000).
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
+    /// default), or "ansi" (with color/attribute escapes).
+    #[serde(default)]
+    format: WaitReturn,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -350,20 +365,6 @@ fn screen_format(s: Option<&str>) -> ScreenFormat {
         Some("ansi") => ScreenFormat::Ansi,
         _ => ScreenFormat::Text,
     }
-}
-
-/// Format a screen dump as a human-readable block with a status line.
-/// Size is width x height. Cursor is x (column) and y (row), both 0-based.
-fn render_dump(d: &session::ScreenDump) -> String {
-    format!(
-        "[size {}W x {}H] cursor=(x{}, y{}){}\n{}",
-        d.cols,
-        d.rows,
-        d.cursor_col,
-        d.cursor_row,
-        if d.cursor_hidden { " hidden" } else { "" },
-        d.text
-    )
 }
 
 #[tool_router]
@@ -718,7 +719,7 @@ impl TuiServer {
         let out = self
             .sessions
             .with(&a.name, |s| match s {
-                Session::Pty(p) => Ok(render_dump(&p.dump(fmt))),
+                Session::Pty(p) => Ok(p.dump(fmt).render()),
                 Session::Piped(_) => {
                     Err(anyhow::anyhow!("session is piped, use read_output instead"))
                 }
@@ -924,6 +925,7 @@ impl TuiServer {
     ) -> Result<CallToolResult, McpError> {
         let timeout = a.timeout_ms.unwrap_or(5000);
         let absent = a.absent.unwrap_or(false);
+        let format = a.format;
         let re = if a.regex.unwrap_or(false) {
             Some(
                 regex::Regex::new(&a.text)
@@ -932,31 +934,39 @@ impl TuiServer {
         } else {
             None
         };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(timeout);
         loop {
-            let dump = self
-                .sessions
-                .with(&a.name, |s| match s {
-                    Session::Pty(p) => Ok(p.dump(ScreenFormat::Text)),
-                    Session::Piped(_) => Err(anyhow::anyhow!("wait_for_text needs a pty session")),
-                })
-                .map_err(|e| err(&e))?;
-            let found = match &re {
-                Some(r) => r.is_match(&dump.text),
-                None => dump.text.contains(&a.text),
-            };
-            if found != absent {
+            let expired = tokio::time::Instant::now() >= deadline;
+            let sample = sample_screen(
+                &self.sessions,
+                &a.name,
+                "wait_for_text",
+                format,
+                expired,
+                |text| {
+                    let found = match &re {
+                        Some(r) => r.is_match(text),
+                        None => text.contains(&a.text),
+                    };
+                    found != absent
+                },
+            )
+            .map_err(|e| err(&e))?;
+            if sample.matched {
                 let what = if absent { "gone" } else { "matched" };
-                return Ok(reply(format!("{what}\n{}", render_dump(&dump))));
+                let outcome = format!("{what} in ~{}ms", round_ms(started.elapsed().as_millis()));
+                return Ok(reply(wait_reply(&outcome, format, &sample)));
             }
-            if tokio::time::Instant::now() >= deadline {
+            if expired {
                 let what = if absent { "still present" } else { "not found" };
-                return Ok(reply(format!(
-                    "TIMEOUT after {timeout}ms: text {what}\n{}",
-                    render_dump(&dump)
+                return Ok(reply(wait_reply(
+                    &format!("TIMEOUT after {timeout}ms: text {what}"),
+                    format,
+                    &sample,
                 )));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
     }
 
@@ -969,25 +979,45 @@ impl TuiServer {
         Parameters(a): Parameters<WaitChangeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let timeout = a.timeout_ms.unwrap_or(5000);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
-        let read = |srv: &Self| {
-            srv.sessions.with(&a.name, |s| match s {
-                Session::Pty(p) => Ok(p.dump(ScreenFormat::Text)),
-                Session::Piped(_) => Err(anyhow::anyhow!("wait_for_change needs a pty session")),
-            })
-        };
-        let initial = read(self).map_err(|e| err(&e))?.text;
+        let format = a.format;
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(timeout);
+        // Snapshot the starting frame (never rendered/returned) to compare against.
+        let initial = sample_screen(
+            &self.sessions,
+            &a.name,
+            "wait_for_change",
+            WaitReturn::None,
+            false,
+            |_| false,
+        )
+        .map_err(|e| err(&e))?
+        .base
+        .text;
         loop {
-            let dump = read(self).map_err(|e| err(&e))?;
-            if dump.text != initial {
-                return Ok(reply(format!("changed\n{}", render_dump(&dump))));
+            let sample = sample_screen(
+                &self.sessions,
+                &a.name,
+                "wait_for_change",
+                format,
+                false,
+                |text| text != initial,
+            )
+            .map_err(|e| err(&e))?;
+            if sample.matched {
+                let outcome = format!("changed in ~{}ms", round_ms(started.elapsed().as_millis()));
+                return Ok(reply(wait_reply(&outcome, format, &sample)));
             }
+            // Timeout means the screen never changed, so it still equals what the
+            // caller already had — return the outcome only, never the screen.
             if tokio::time::Instant::now() >= deadline {
                 return Ok(reply(format!(
-                    "TIMEOUT after {timeout}ms: screen unchanged"
+                    "TIMEOUT after {timeout}ms: screen unchanged while this tool ran. \
+                    If you expected a reaction to an earlier call, it may have landed before \
+                    the wait began — confirm with read_screen."
                 )));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
     }
 
@@ -1017,7 +1047,7 @@ impl TuiServer {
             if tokio::time::Instant::now() >= deadline {
                 return Ok(reply(format!("TIMEOUT after {timeout}ms: still running")));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
     }
 
@@ -1065,7 +1095,7 @@ impl TuiServer {
                     "TIMEOUT after {timeout}ms: not found\n{buf}"
                 )));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
     }
 
@@ -1079,35 +1109,43 @@ impl TuiServer {
     ) -> Result<CallToolResult, McpError> {
         let stable_ms = a.stable_ms.unwrap_or(300);
         let timeout = a.timeout_ms.unwrap_or(5000);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
+        let format = a.format;
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(timeout);
         let mut last = String::new();
-        let mut stable_since = tokio::time::Instant::now();
+        let mut stable_since = started;
         loop {
-            let dump = self
-                .sessions
-                .with(&a.name, |s| match s {
-                    Session::Pty(p) => Ok(p.dump(ScreenFormat::Text)),
-                    Session::Piped(_) => {
-                        Err(anyhow::anyhow!("wait_for_stable needs a pty session"))
-                    }
-                })
-                .map_err(|e| err(&e))?;
             let now = tokio::time::Instant::now();
-            if dump.text != last {
-                last = dump.text.clone();
-                stable_since = now;
-            } else if now.duration_since(stable_since)
-                >= std::time::Duration::from_millis(stable_ms)
-            {
-                return Ok(reply(format!("stable\n{}", render_dump(&dump))));
+            let expired = now >= deadline;
+            let stable_for = std::time::Duration::from_millis(stable_ms);
+            // Stable only when the frame equals the last one AND it has held
+            // long enough; a changed frame is never "stable" this poll.
+            let sample = sample_screen(
+                &self.sessions,
+                &a.name,
+                "wait_for_stable",
+                format,
+                expired,
+                |text| text == last && now.duration_since(stable_since) >= stable_for,
+            )
+            .map_err(|e| err(&e))?;
+
+            if sample.matched {
+                let outcome = format!("stable in ~{}ms", round_ms(started.elapsed().as_millis()));
+                return Ok(reply(wait_reply(&outcome, format, &sample)));
             }
-            if now >= deadline {
-                return Ok(reply(format!(
-                    "TIMEOUT after {timeout}ms: still changing\n{}",
-                    render_dump(&dump)
+            if sample.base.text != last {
+                last = sample.base.text.clone();
+                stable_since = now;
+            }
+            if expired {
+                return Ok(reply(wait_reply(
+                    &format!("TIMEOUT after {timeout}ms: still changing"),
+                    format,
+                    &sample,
                 )));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
     }
 }
@@ -1513,5 +1551,99 @@ mod tests {
         assert_eq!(out, format!("{cycle}{cycle}"));
 
         srv.sessions.remove("catsess").ok();
+    }
+
+    #[test]
+    fn wait_return_defaults_to_text() {
+        assert_eq!(WaitReturn::default(), WaitReturn::Text);
+    }
+
+    #[test]
+    fn wait_return_schema_is_flat_enum() {
+        // The `schema::flatten_enum` transform must collapse schemars' default
+        // oneOf/const representation into a compact `{"type":"string","enum":[…]}`.
+        let schema = schemars::schema_for!(WaitReturn);
+        let obj = schema.as_object().unwrap();
+        assert_eq!(obj.get("type").and_then(|v| v.as_str()), Some("string"));
+        assert_eq!(
+            obj.get("enum").and_then(|v| v.as_array()),
+            Some(&vec![
+                serde_json::json!("none"),
+                serde_json::json!("text"),
+                serde_json::json!("ansi"),
+            ]),
+        );
+        // The oneOf shape (and per-variant descriptions) must be gone.
+        assert!(
+            obj.get("oneOf").is_none(),
+            "oneOf should be collapsed: {schema:?}"
+        );
+    }
+
+    #[test]
+    fn wait_return_property_is_inlined() {
+        // `#[schemars(inline)]` must embed the enum directly into each tool's
+        // `format` property (no `$ref` / `$defs`), so clients that don't resolve
+        // references still see the type and allowed values.
+        for root in [
+            schemars::schema_for!(WaitTextArgs),
+            schemars::schema_for!(WaitStableArgs),
+        ] {
+            let root = root.as_object().unwrap();
+            assert!(
+                root.get("$defs").is_none() && root.get("definitions").is_none(),
+                "enum should be inlined, no defs: {root:?}"
+            );
+            let fmt = root["properties"]["format"].as_object().unwrap();
+            assert!(
+                fmt.get("$ref").is_none(),
+                "format must not be a $ref: {fmt:?}"
+            );
+            assert_eq!(fmt.get("type").and_then(|v| v.as_str()), Some("string"));
+            assert!(fmt.get("enum").is_some());
+            assert_eq!(fmt.get("default").and_then(|v| v.as_str()), Some("text"));
+        }
+    }
+
+    #[test]
+    fn wait_args_schema_emits_format_default() {
+        // `#[serde(default)]` + `Serialize` on WaitReturn is enough for schemars
+        // to surface `"default":"text"` — no `#[schemars(default)]` needed.
+        for schema in [
+            serde_json::to_string(&schemars::schema_for!(WaitTextArgs)).unwrap(),
+            serde_json::to_string(&schemars::schema_for!(WaitStableArgs)).unwrap(),
+        ] {
+            assert!(
+                schema.contains(r#""default":"text""#),
+                "missing default in {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_return_deserializes_lowercase() {
+        assert_eq!(
+            serde_json::from_str::<WaitReturn>("\"none\"").unwrap(),
+            WaitReturn::None
+        );
+        assert_eq!(
+            serde_json::from_str::<WaitReturn>("\"text\"").unwrap(),
+            WaitReturn::Text
+        );
+        assert_eq!(
+            serde_json::from_str::<WaitReturn>("\"ansi\"").unwrap(),
+            WaitReturn::Ansi
+        );
+        assert!(serde_json::from_str::<WaitReturn>("\"bogus\"").is_err());
+    }
+
+    #[test]
+    fn wait_text_args_format_is_optional_and_defaults() {
+        // Omitting `format` must keep the plain-text default (backward compat).
+        let a: WaitTextArgs = serde_json::from_str(r#"{"name":"s","text":"Ready"}"#).unwrap();
+        assert_eq!(a.format, WaitReturn::Text);
+        let a: WaitTextArgs =
+            serde_json::from_str(r#"{"name":"s","text":"Ready","format":"none"}"#).unwrap();
+        assert_eq!(a.format, WaitReturn::None);
     }
 }
