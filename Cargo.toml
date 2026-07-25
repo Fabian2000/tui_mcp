@@ -1,6 +1,6 @@
 [package]
 name = "tui_mcp"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "An MCP server for remote-controlling and observing TUI programs via a real PTY and an embedded terminal emulator."
 license = "MIT OR Apache-2.0"
