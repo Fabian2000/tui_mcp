@@ -202,6 +202,10 @@ struct WaitChangeArgs {
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
+    /// default), or "ansi" (with color/attribute escapes).
+    #[serde(default)]
+    format: WaitReturn,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -973,22 +977,40 @@ impl TuiServer {
         Parameters(a): Parameters<WaitChangeArgs>,
     ) -> Result<CallToolResult, McpError> {
         let timeout = a.timeout_ms.unwrap_or(5000);
+        let format = a.format;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
-        let read = |srv: &Self| {
-            srv.sessions.with(&a.name, |s| match s {
-                Session::Pty(p) => Ok(p.dump(ScreenFormat::Text)),
-                Session::Piped(_) => Err(anyhow::anyhow!("wait_for_change needs a pty session")),
-            })
-        };
-        let initial = read(self).map_err(|e| err(&e))?.text;
+        // Snapshot the starting frame (never rendered/returned) to compare against.
+        let initial = sample_screen(
+            &self.sessions,
+            &a.name,
+            "wait_for_change",
+            WaitReturn::None,
+            false,
+            |_| false,
+        )
+        .map_err(|e| err(&e))?
+        .base
+        .text;
         loop {
-            let dump = read(self).map_err(|e| err(&e))?;
-            if dump.text != initial {
-                return Ok(reply(format!("changed\n{}", dump.render())));
+            let sample = sample_screen(
+                &self.sessions,
+                &a.name,
+                "wait_for_change",
+                format,
+                false,
+                |text| text != initial,
+            )
+            .map_err(|e| err(&e))?;
+            if sample.matched {
+                return Ok(reply(wait_reply("changed", format, &sample)));
             }
+            // Timeout means the screen never changed, so it still equals what the
+            // caller already had — return the outcome only, never the screen.
             if tokio::time::Instant::now() >= deadline {
                 return Ok(reply(format!(
-                    "TIMEOUT after {timeout}ms: screen unchanged"
+                    "TIMEOUT after {timeout}ms: screen unchanged while this tool ran. \
+                    If you expected a reaction to an earlier call, it may have landed before \
+                    the wait began — confirm with read_screen."
                 )));
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

@@ -82,7 +82,7 @@ Check your client's own documentation for the exact location and format.
 | `resize` | Resize a pty (cols by rows). |
 | `wait_for_text` | Block until text appears on screen. `regex` matches a pattern, `absent` waits for it to disappear. `format` controls the returned screen (`none`/`text`/`ansi`). |
 | `wait_for_stable` | Block until the screen stops changing (with timeout). `format` controls the returned screen (`none`/`text`/`ansi`). |
-| `wait_for_change` | Block until the screen changes from its current contents. |
+| `wait_for_change` | Block until the screen changes from its current contents. `format` controls the returned screen (`none`/`text`/`ansi`). If screen is not changed &ndash; just returns status line. |
 | `wait_for_exit` | Block until the program exits. Returns the exit status (pty or piped). |
 | `wait_for_output` | Block until a piped session's stdout/stderr contains text or a regex match. |
 | `sleep` | Fixed wait, capped by `max_ms` (hard cap 60 s). |
@@ -124,12 +124,12 @@ color or layout question cannot be answered from text alone.
 
 ## Wait tools: returning the screen
 
-`wait_for_text` and `wait_for_stable` take an optional `format` that says what to
-return once the wait resolves:
+`wait_for_text`, `wait_for_stable`, and `wait_for_change` take an optional
+`format` that says what to return once the wait resolves:
 
-- `none` — the outcome only (`matched` / `gone`, or a `TIMEOUT ...` line). No
-  screen payload. Use it when the call is pure synchronization and the screen
-  would be discarded.
+- `none` — the outcome only (`matched` / `gone` / `changed`, or a `TIMEOUT ...`
+  line). No screen payload. Use it when the call is pure synchronization and the
+  screen would be discarded.
 - `text` — the plain-text screen (the default; omitting `format` is unchanged
   behavior).
 - `ansi` — the screen with ANSI color/attribute escapes, like
@@ -140,6 +140,10 @@ changes *whether* the wait matches — only what comes back. `text`/`ansi` captu
 the screen from the same frame that satisfied the wait, so the returned ANSI is
 guaranteed to be the state that matched (no separate `read_screen` race on UIs
 that redraw quickly).
+
+For `wait_for_change`, a timeout means the screen never changed, so it still
+equals what the caller already had. In that case the timeout returns the outcome
+line alone regardless of `format` — the unchanged screen is never echoed back.
 
 ## Scrollback
 
