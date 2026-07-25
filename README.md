@@ -127,9 +127,10 @@ color or layout question cannot be answered from text alone.
 `wait_for_text`, `wait_for_stable`, and `wait_for_change` take an optional
 `format` that says what to return once the wait resolves:
 
-- `none` — the outcome only (`matched` / `gone` / `changed`, or a `TIMEOUT ...`
-  line). No screen payload. Use it when the call is pure synchronization and the
-  screen would be discarded.
+- `none` — the outcome only (e.g. `matched in ~40ms` / `gone in ~40ms` /
+  `changed in ~40ms` / `stable in ~350ms`, or a `TIMEOUT ...` line). No screen
+  payload. Use it when the call is pure synchronization and the screen would be
+  discarded.
 - `text` — the plain-text screen (the default; omitting `format` is unchanged
   behavior).
 - `ansi` — the screen with ANSI color/attribute escapes, like
@@ -140,6 +141,11 @@ changes *whether* the wait matches — only what comes back. `text`/`ansi` captu
 the screen from the same frame that satisfied the wait, so the returned ANSI is
 guaranteed to be the state that matched (no separate `read_screen` race on UIs
 that redraw quickly).
+
+A successful outcome carries how long the wait took (`in ~{N}ms`). It is
+approximate — measured from when the tool started polling, not from any earlier
+input, and rounded to the poll granularity — so treat it as a rough latency
+signal, not an exact reaction time.
 
 For `wait_for_change`, a timeout means the screen never changed, so it still
 equals what the caller already had. In that case the timeout returns the outcome

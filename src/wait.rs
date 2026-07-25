@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::{ScreenDump, ScreenFormat, Session, SessionManager};
 
+/// How often the `wait_*` loops re-poll the screen. Also the granularity floor
+/// for the `~{N}ms` timing in success outcomes — see [`round_ms`].
+pub(crate) const POLL_INTERVAL_MS: u64 = 50;
+
+/// Round a millisecond elapsed to the nearest 10 ms. The `~{N}ms` shown in wait
+/// outcomes is only as precise as the [`POLL_INTERVAL_MS`] poll cadence, so raw
+/// trailing digits would be false precision.
+pub(crate) fn round_ms(ms: u128) -> u128 {
+    (ms + 5) / 10 * 10
+}
+
 /// How much of the screen a `wait_*` tool returns once it resolves.
 #[derive(
     Serialize, /* Without it json schema won't be able to display "default" value */
@@ -102,6 +113,16 @@ mod tests {
             rows: 40,
             cols: 120,
         }
+    }
+
+    #[test]
+    fn round_ms_rounds_to_nearest_10() {
+        assert_eq!(round_ms(0), 0);
+        assert_eq!(round_ms(4), 0);
+        assert_eq!(round_ms(5), 10);
+        assert_eq!(round_ms(44), 40);
+        assert_eq!(round_ms(45), 50);
+        assert_eq!(round_ms(103), 100);
     }
 
     #[test]
