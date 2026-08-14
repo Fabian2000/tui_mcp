@@ -67,6 +67,18 @@ struct NameArg {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct ScreenshotArgs {
+    name: String,
+    /// If set, write the PNG to this file path instead of returning the image
+    /// inline. This saves context tokens (the image never enters the model's
+    /// context) and produces a shareable file, e.g. to show the user or to put
+    /// in documentation. The path may be absolute or relative to the server's
+    /// working directory; missing parent directories are created.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct SendKeyArgs {
     name: String,
     /// Key name: a single char, or "enter", "tab", "esc", "up", "f5",
@@ -731,11 +743,14 @@ impl TuiServer {
     #[tool(
         description = "Take a PNG screenshot of the pty screen, for checking colors / \
         layout. PREFER read_screen (plain text) when you only need the content, since it is \
-        much cheaper in tokens. Use this only when color or visual layout matters."
+        much cheaper in tokens. Use this only when color or visual layout matters. Pass \
+        `path` to save the PNG to disk and return only a short confirmation instead of the \
+        image, which avoids spending context tokens (useful when the screenshot is just for \
+        the user or for documentation)."
     )]
     async fn screenshot(
         &self,
-        Parameters(a): Parameters<NameArg>,
+        Parameters(a): Parameters<ScreenshotArgs>,
     ) -> Result<CallToolResult, McpError> {
         let png = self
             .sessions
@@ -744,11 +759,32 @@ impl TuiServer {
                 Session::Piped(_) => Err(anyhow::anyhow!("screenshots need a pty session")),
             })
             .map_err(|e| err(&e))?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-        Ok(CallToolResult::success(vec![Content::image(
-            b64,
-            "image/png".to_string(),
-        )]))
+
+        let Some(path) = a.path else {
+            // No path: return the image inline for the model to see.
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+            return Ok(CallToolResult::success(vec![Content::image(
+                b64,
+                "image/png".to_string(),
+            )]));
+        };
+
+        // Path given: write the PNG to disk and return a short confirmation.
+        if let Some(parent) = std::path::Path::new(&path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                McpError::internal_error(
+                    format!("failed to create directory for '{path}': {e}"),
+                    None,
+                )
+            })?;
+        }
+        let bytes = png.len();
+        std::fs::write(&path, &png).map_err(|e| {
+            McpError::internal_error(format!("failed to write screenshot to '{path}': {e}"), None)
+        })?;
+        Ok(reply(format!("wrote {bytes}-byte PNG to {path}")))
     }
 
     #[tool(
