@@ -49,6 +49,7 @@ pub struct PtySession {
     cwd: String,
     kitty: crate::kitty::KittyFlags,
     paste: crate::kitty::PasteFlag,
+    hyperlinks: crate::osc8::HyperlinkLog,
 }
 
 pub struct PipedSession {
@@ -192,9 +193,11 @@ impl PtySession {
 
         let kitty: crate::kitty::KittyFlags = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let paste: crate::kitty::PasteFlag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hyperlinks: crate::osc8::HyperlinkLog = Arc::new(Mutex::new(Vec::new()));
         let parser_for_thread = Arc::clone(&parser);
         let writer_for_thread = Arc::clone(&writer);
         let mut detector = crate::kitty::KittyDetector::new(Arc::clone(&kitty), Arc::clone(&paste));
+        let mut osc8 = crate::osc8::Osc8Tracker::new(Arc::clone(&hyperlinks));
         let reader_handle = std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -227,6 +230,7 @@ impl PtySession {
                             let _ = w.write_all(resp.as_bytes());
                             let _ = w.flush();
                         }
+                        osc8.feed(&buf[..n]);
                         parser_for_thread.lock().process(&buf[..n]);
                     }
                 }
@@ -245,6 +249,7 @@ impl PtySession {
             cwd: resolve_cwd(opts),
             kitty,
             paste,
+            hyperlinks,
         })
     }
 
@@ -301,7 +306,13 @@ impl PtySession {
         let text = match format {
             ScreenFormat::Text => screen.contents(),
             ScreenFormat::Ansi => {
-                String::from_utf8_lossy(&screen.contents_formatted()).into_owned()
+                let mut ansi = String::from_utf8_lossy(&screen.contents_formatted()).into_owned();
+                let links = self.hyperlinks.lock();
+                if let Some(footnote) = crate::osc8::visible_footnote(&screen.contents(), &links) {
+                    ansi.push_str("\n\n");
+                    ansi.push_str(&footnote);
+                }
+                ansi
             }
         };
         ScreenDump {

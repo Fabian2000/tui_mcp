@@ -123,6 +123,11 @@ it by default. `screenshot` renders the screen to a PNG with the real foreground
 and background colors, which costs far more tokens. Reach for it only when a
 color or layout question cannot be answered from text alone.
 
+When a program emits OSC 8 hyperlinks, `format: "ansi"` appends a `Hyperlinks:`
+footnote listing the URIs of links whose text is currently on screen. This is
+best effort: links are matched back to the screen by their display text, since
+the emulator does not track their exact position.
+
 ## Wait tools: returning the screen
 
 `wait_for_text`, `wait_for_stable`, and `wait_for_change` take an optional

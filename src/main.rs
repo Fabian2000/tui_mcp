@@ -7,6 +7,7 @@
 mod keys;
 mod kitty;
 mod mouse;
+mod osc8;
 mod render;
 mod schema;
 mod session;
