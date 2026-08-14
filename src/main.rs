@@ -67,6 +67,13 @@ struct NameArg {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct ScreenshotFileArgs {
+    name: String,
+    /// Path to write the PNG to. Missing parent directories are created.
+    path: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct SendKeyArgs {
     name: String,
     /// Key name: a single char, or "enter", "tab", "esc", "up", "f5",
@@ -358,6 +365,16 @@ fn shell_quote(s: &str) -> String {
 
 fn err(e: &anyhow::Error) -> McpError {
     McpError::internal_error(e.to_string(), None)
+}
+
+/// Write `png` to `path`, creating missing parent directories.
+async fn write_png(path: &std::path::Path, png: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, png).await
 }
 
 fn screen_format(s: Option<&str>) -> ScreenFormat {
@@ -749,6 +766,34 @@ impl TuiServer {
             b64,
             "image/png".to_string(),
         )]))
+    }
+
+    #[tool(
+        description = "Take a PNG screenshot of the pty screen and write it to `path`, \
+        returning a short text confirmation instead of the image. Use this when the \
+        screenshot is only needed as a file, for the user or for documentation. To get a \
+        screenshot back inline for inspection, use screenshot."
+    )]
+    async fn screenshot_to_file(
+        &self,
+        Parameters(a): Parameters<ScreenshotFileArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let png = self
+            .sessions
+            .with(&a.name, |s| match s {
+                Session::Pty(p) => p.screenshot(),
+                Session::Piped(_) => Err(anyhow::anyhow!("screenshots need a pty session")),
+            })
+            .map_err(|e| err(&e))?;
+        write_png(std::path::Path::new(&a.path), &png)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(
+                    format!("failed to write screenshot to '{}': {e}", a.path),
+                    None,
+                )
+            })?;
+        Ok(reply(format!("wrote {} bytes to {}", png.len(), a.path)))
     }
 
     #[tool(
@@ -1295,6 +1340,24 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn write_png_creates_parent_dirs() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp-tests");
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let path = base.join("nested").join("shot.png");
+        let bytes = [0x89u8, b'P', b'N', b'G', 1, 2, 3];
+
+        write_png(&path, &bytes)
+            .await
+            .expect("write_png should succeed");
+
+        let read_back = tokio::fs::read(&path)
+            .await
+            .expect("written file should exist");
+        assert_eq!(read_back, bytes);
+        tokio::fs::remove_dir_all(&base).await.expect("cleanup");
+    }
 
     #[test]
     fn parse_combo_plain_key() {

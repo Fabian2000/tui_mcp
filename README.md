@@ -75,6 +75,7 @@ Check your client's own documentation for the exact location and format.
 | `send_mouse` | Click, scroll, drag, or hover at 1-based `(x, y)` (SGR mouse reporting). `count` repeats the action (`count: 2` = double-click); `delay_ms` spaces the repeats. |
 | `read_screen` | Dump the pty screen as text or ANSI, with size and cursor. Preferred and cheapest. |
 | `screenshot` | PNG of the pty screen for color and layout checks. Costlier, so use it only when colors matter. |
+| `screenshot_to_file` | Write a PNG of the pty screen to a file and return a short confirmation, for the user or documentation. |
 | `read_scrollback` | Paged scrollback history (visible plus scrolled-off lines) with line numbers. |
 | `search_scrollback` | Regex search over scrollback. Returns matching lines with optional context. |
 | `read_output` | Read buffered stdout/stderr of a piped session (`clear` to drain). |
