@@ -230,8 +230,15 @@ impl PtySession {
                             let _ = w.write_all(resp.as_bytes());
                             let _ = w.flush();
                         }
-                        osc8.feed(&buf[..n]);
-                        parser_for_thread.lock().process(&buf[..n]);
+                        // Update the screen and log the chunk's hyperlinks under one
+                        // lock, emulator first. A read that landed between the two
+                        // would otherwise see a link logged but not yet drawn, and
+                        // `visible_footnote` would retire it for good.
+                        {
+                            let mut parser = parser_for_thread.lock();
+                            parser.process(&buf[..n]);
+                            osc8.feed(&buf[..n]);
+                        }
                     }
                 }
             }
@@ -307,8 +314,10 @@ impl PtySession {
             ScreenFormat::Text => screen.contents(),
             ScreenFormat::Ansi => {
                 let mut ansi = String::from_utf8_lossy(&screen.contents_formatted()).into_owned();
-                let links = self.hyperlinks.lock();
-                if let Some(footnote) = crate::osc8::visible_footnote(&screen.contents(), &links) {
+                let mut links = self.hyperlinks.lock();
+                if let Some(footnote) =
+                    crate::osc8::visible_footnote(&screen.contents(), &mut links)
+                {
                     ansi.push_str("\n\n");
                     ansi.push_str(&footnote);
                 }

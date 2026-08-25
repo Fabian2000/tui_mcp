@@ -126,7 +126,9 @@ color or layout question cannot be answered from text alone.
 When a program emits OSC 8 hyperlinks, `format: "ansi"` appends a `Hyperlinks:`
 footnote listing the URIs of links whose text is currently on screen. This is
 best effort: links are matched back to the screen by their display text, since
-the emulator does not track their exact position.
+the emulator does not track their exact position. A link is forgotten as soon as
+a read no longer finds its text, so a link that has scrolled away will not
+reappear later just because another line happens to contain the same words.
 
 ## Wait tools: returning the screen
 
