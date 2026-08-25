@@ -70,7 +70,8 @@ struct NameArg {
 #[derive(Deserialize, JsonSchema)]
 struct ScreenshotFileArgs {
     name: String,
-    /// Path to write the PNG to. Missing parent directories are created.
+    /// Path to write the PNG to. Must not already exist. Missing parent
+    /// directories are created.
     path: String,
 }
 
@@ -368,14 +369,29 @@ fn err(e: &anyhow::Error) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
-/// Write `png` to `path`, creating missing parent directories.
+/// Write `png` to `path`, creating missing parent directories. Fails with
+/// [`std::io::ErrorKind::AlreadyExists`] rather than overwriting: a screenshot is
+/// not worth clobbering a file the user may care about, and a caller that really
+/// wants to replace one can delete it first.
 async fn write_png(path: &std::path::Path, png: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(path, png).await
+    // Never clobber an existing file: destroying one must be a deliberate act by
+    // the caller, not a side effect of taking a screenshot. `create_new` tests and
+    // creates in a single syscall, so unlike an `exists()` check followed by a
+    // write there is no window for the file to appear in between.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await?;
+    file.write_all(png).await?;
+    file.flush().await
 }
 
 fn screen_format(s: Option<&str>) -> ScreenFormat {
@@ -773,7 +789,8 @@ impl TuiServer {
         description = "Take a PNG screenshot of the pty screen and write it to `path`, \
         returning a short text confirmation instead of the image. Use this when the \
         screenshot is only needed as a file, for the user or for documentation. To get a \
-        screenshot back inline for inspection, use screenshot."
+        screenshot back inline for inspection, use screenshot. `path` must not already \
+        exist; the tool fails rather than overwriting it."
     )]
     async fn screenshot_to_file(
         &self,
@@ -789,10 +806,17 @@ impl TuiServer {
         write_png(std::path::Path::new(&a.path), &png)
             .await
             .map_err(|e| {
-                McpError::internal_error(
-                    format!("failed to write screenshot to '{}': {e}", a.path),
-                    None,
-                )
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    McpError::invalid_params(
+                        format!("'{}' already exists; pick a path that does not", a.path),
+                        None,
+                    )
+                } else {
+                    McpError::internal_error(
+                        format!("failed to write screenshot to '{}': {e}", a.path),
+                        None,
+                    )
+                }
             })?;
         Ok(reply(format!("wrote {} bytes to {}", png.len(), a.path)))
     }
@@ -1357,6 +1381,26 @@ mod tests {
             .await
             .expect("written file should exist");
         assert_eq!(read_back, bytes);
+        tokio::fs::remove_dir_all(&base).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn write_png_refuses_to_overwrite() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp-tests-exists");
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let path = base.join("shot.png");
+        let original = [0x89u8, b'P', b'N', b'G', 1, 2, 3];
+
+        write_png(&path, &original).await.expect("first write");
+
+        let e = write_png(&path, b"replacement")
+            .await
+            .expect_err("second write should fail");
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+
+        // The failure must leave the existing file exactly as it was.
+        let read_back = tokio::fs::read(&path).await.expect("file still there");
+        assert_eq!(read_back, original);
         tokio::fs::remove_dir_all(&base).await.expect("cleanup");
     }
 
