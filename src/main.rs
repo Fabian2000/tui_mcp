@@ -70,7 +70,9 @@ struct NameArg {
 #[derive(Deserialize, JsonSchema)]
 struct ScreenshotFileArgs {
     name: String,
-    /// Path to write the PNG to. Missing parent directories are created.
+    /// Path to write the PNG to. Missing parent directories are created. If the
+    /// path already exists, an indexed name like `shot(1).png` is used instead,
+    /// and the returned confirmation names the path actually written.
     path: String,
 }
 
@@ -368,14 +370,66 @@ fn err(e: &anyhow::Error) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
-/// Write `png` to `path`, creating missing parent directories.
-async fn write_png(path: &std::path::Path, png: &[u8]) -> std::io::Result<()> {
+const MAX_SCREENSHOT_COLLISIONS: u32 = 1000;
+
+/// Candidate path for the `n`-th collision: `0` is `path` itself, `n >= 1`
+/// inserts `(n)` before the extension, e.g. `shot(1).png`.
+fn indexed_path(path: &std::path::Path, n: u32) -> std::path::PathBuf {
+    if n == 0 {
+        return path.to_path_buf();
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let name = match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{stem}({n}).{ext}"),
+        None => format!("{stem}({n})"),
+    };
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => std::path::PathBuf::from(name),
+    }
+}
+
+/// Write `png` to `path` without overwriting: missing parent directories are
+/// created, and if `path` exists the name gains `(1)`, `(2)`, ... until one is
+/// free. Returns the path actually written.
+///
+/// # Errors
+/// Returns an error if the directory or file cannot be created, or if every
+/// indexed name up to the collision limit is already taken.
+async fn write_png(path: &std::path::Path, png: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use tokio::io::AsyncWriteExt as _;
+
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(path, png).await
+    for n in 0..=MAX_SCREENSHOT_COLLISIONS {
+        let candidate = indexed_path(path, n);
+        // create_new tests and creates in one syscall, so an existing file is
+        // never truncated and two writers cannot pick the same name.
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(mut file) => {
+                file.write_all(png).await?;
+                file.flush().await?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "too many colliding screenshot files",
+    ))
 }
 
 fn screen_format(s: Option<&str>) -> ScreenFormat {
@@ -773,7 +827,9 @@ impl TuiServer {
         description = "Take a PNG screenshot of the pty screen and write it to `path`, \
         returning a short text confirmation instead of the image. Use this when the \
         screenshot is only needed as a file, for the user or for documentation. To get a \
-        screenshot back inline for inspection, use screenshot."
+        screenshot back inline for inspection, use screenshot. An existing `path` is never \
+        overwritten: an indexed name like `shot(1).png` is used instead, and the result \
+        reports the path actually written."
     )]
     async fn screenshot_to_file(
         &self,
@@ -786,15 +842,19 @@ impl TuiServer {
                 Session::Piped(_) => Err(anyhow::anyhow!("screenshots need a pty session")),
             })
             .map_err(|e| err(&e))?;
-        write_png(std::path::Path::new(&a.path), &png)
+        let written = write_png(std::path::Path::new(&a.path), &png)
             .await
             .map_err(|e| {
                 McpError::internal_error(
-                    format!("failed to write screenshot to '{}': {e}", a.path),
+                    format!("failed to write screenshot for '{}': {e}", a.path),
                     None,
                 )
             })?;
-        Ok(reply(format!("wrote {} bytes to {}", png.len(), a.path)))
+        Ok(reply(format!(
+            "wrote {} bytes to {}",
+            png.len(),
+            written.display()
+        )))
     }
 
     #[tool(
@@ -1349,15 +1409,52 @@ mod tests {
         let path = base.join("nested").join("shot.png");
         let bytes = [0x89u8, b'P', b'N', b'G', 1, 2, 3];
 
-        write_png(&path, &bytes)
+        let written = write_png(&path, &bytes)
             .await
             .expect("write_png should succeed");
 
+        assert_eq!(written, path);
         let read_back = tokio::fs::read(&path)
             .await
             .expect("written file should exist");
         assert_eq!(read_back, bytes);
         tokio::fs::remove_dir_all(&base).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn write_png_indexes_on_collision() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".tmp-tests-collision");
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let path = base.join("shot.png");
+        let first = [1u8, 2, 3];
+        let second = [4u8, 5, 6];
+
+        let p1 = write_png(&path, &first).await.expect("first write");
+        let p2 = write_png(&path, &second).await.expect("second write");
+
+        assert_eq!(p1, path);
+        assert_eq!(p2, base.join("shot(1).png"));
+        // The original file must be left untouched by the second write.
+        assert_eq!(tokio::fs::read(&path).await.expect("original"), first);
+        assert_eq!(tokio::fs::read(&p2).await.expect("indexed"), second);
+        tokio::fs::remove_dir_all(&base).await.expect("cleanup");
+    }
+
+    #[test]
+    fn indexed_path_inserts_index_before_extension() {
+        let p = std::path::Path::new("/tmp/shot.png");
+        assert_eq!(
+            indexed_path(p, 0),
+            std::path::PathBuf::from("/tmp/shot.png")
+        );
+        assert_eq!(
+            indexed_path(p, 2),
+            std::path::PathBuf::from("/tmp/shot(2).png")
+        );
+        assert_eq!(
+            indexed_path(std::path::Path::new("shot"), 1),
+            std::path::PathBuf::from("shot(1)")
+        );
     }
 
     #[test]

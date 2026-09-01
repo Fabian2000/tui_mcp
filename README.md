@@ -75,7 +75,7 @@ Check your client's own documentation for the exact location and format.
 | `send_mouse` | Click, scroll, drag, or hover at 1-based `(x, y)` (SGR mouse reporting). `count` repeats the action (`count: 2` = double-click); `delay_ms` spaces the repeats. |
 | `read_screen` | Dump the pty screen as text or ANSI, with size and cursor. Preferred and cheapest. |
 | `screenshot` | PNG of the pty screen for color and layout checks. Costlier, so use it only when colors matter. |
-| `screenshot_to_file` | Write a PNG of the pty screen to a file and return a short confirmation, for the user or documentation. |
+| `screenshot_to_file` | Write a PNG of the pty screen to a file and return a short confirmation, for the user or documentation. Never overwrites: uses an indexed name like `shot(1).png` on collision. |
 | `read_scrollback` | Paged scrollback history (visible plus scrolled-off lines) with line numbers. |
 | `search_scrollback` | Regex search over scrollback. Returns matching lines with optional context. |
 | `read_output` | Read buffered stdout/stderr of a piped session (`clear` to drain). |
@@ -122,6 +122,12 @@ Single characters, or one of: `enter`, `tab`, `esc`, `backspace`, `delete`,
 it by default. `screenshot` renders the screen to a PNG with the real foreground
 and background colors, which costs far more tokens. Reach for it only when a
 color or layout question cannot be answered from text alone.
+
+`screenshot_to_file` writes the same PNG to a file and returns only a short
+confirmation, so it spends no image tokens. Use it when the picture is for a
+human or for documentation rather than for the model. It never overwrites an
+existing file: it adds `(1)`, `(2)`, ... to the name instead and reports the
+path it wrote.
 
 When a program emits OSC 8 hyperlinks, `format: "ansi"` appends a `Hyperlinks:`
 footnote listing the URIs of links whose text is currently on screen. This is
