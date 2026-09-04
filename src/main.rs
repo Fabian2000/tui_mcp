@@ -4,6 +4,9 @@
 //! pipes, then drive it with simulated keyboard / mouse input and read back the
 //! rendered screen as text.
 
+// Shared with build.rs, which stamps it as the exe's FileDescription.
+include!("display_name.rs");
+
 mod keys;
 mod kitty;
 mod mouse;
@@ -1272,7 +1275,7 @@ impl rmcp::ServerHandler for TuiServer {
             // report rmcp's own name/version (its `env!` runs in rmcp's crate), not ours.
             server_info: rmcp::model::Implementation {
                 name: env!("CARGO_PKG_NAME").to_owned(),
-                title: Some("TUI MCP".to_owned()),
+                title: Some(DISPLAY_NAME.to_owned()),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 website_url: Some(env!("CARGO_PKG_REPOSITORY").to_owned()),
                 ..Default::default()

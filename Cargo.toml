@@ -26,6 +26,16 @@ ab_glyph = "0.2"
 base64 = "0.22"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# cfg() on build-dependencies resolves against the HOST, not the target, so this
+# only applies when building *on* Windows -- matching the #[cfg(windows)] gate on
+# build.rs's main. Cross-compiling to Windows from another host therefore yields
+# an exe with no version resource; if that is ever needed, move this to a plain
+# [build-dependencies] and drop the #[cfg(windows)] in build.rs.
+[target.'cfg(windows)'.build-dependencies]
+# default-features = false drops the "toml" feature, which only exists to parse
+# [package.metadata.winresource]; build.rs sets every field programmatically.
+winresource = { version = "0.1", default-features = false }
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }
 
