@@ -9,6 +9,12 @@ readme = "README.md"
 keywords = ["mcp", "tui", "terminal", "pty", "automation"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+# Exposes the `dev_info` tool, which reports the running executable's path and
+# mtime. Off by default: it exists to confirm a reload picked up a rebuild, so a
+# released server has no use for it.
+dev-tools = ["dep:chrono"]
+
 [dependencies]
 rmcp = { version = "0.8", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -25,6 +31,16 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ab_glyph = "0.2"
 base64 = "0.22"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Only for `dev_info`'s timestamps, and only under `dev-tools`.
+#
+# Nothing extra compiles while rmcp and schemars keep pulling chrono 0.4 in:
+# cargo unifies their requirements with this one onto a single build of it.
+# A manifest cannot ask for "whatever my dependencies already use", so if they
+# move to 0.5 and this stays, cargo silently compiles a second copy rather than
+# reporting a conflict. Move this in step with them.
+chrono = { version = "0.4", optional = true, default-features = false, features = [
+    "std",
+] }
 
 # cfg() on build-dependencies resolves against the HOST, not the target, so this
 # only applies when building *on* Windows -- matching the #[cfg(windows)] gate on

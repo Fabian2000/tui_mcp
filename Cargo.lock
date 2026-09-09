@@ -1074,6 +1074,7 @@ dependencies = [
  "ab_glyph",
  "anyhow",
  "base64",
+ "chrono",
  "image",
  "nix 0.29.0",
  "parking_lot",

@@ -18,6 +18,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --verbose
       - run: cargo test --verbose
+      # Optional features are off by default, so nothing above compiles the code
+      # they gate. Without this run it rots until someone enables a feature.
+      - run: cargo test --all-features --verbose
 
   lint:
     name: fmt + clippy
@@ -29,3 +32,4 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings

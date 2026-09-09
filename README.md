@@ -21,6 +21,72 @@ understands.
 cargo build --release
 ```
 
+## Development build
+
+The `dev-tools` feature adds tooling that exists only to support work on
+`tui_mcp` itself. It is off by default, so a released binary never carries it:
+
+```bash
+cargo build --features dev-tools
+```
+
+It currently adds one tool:
+
+| Tool | Purpose |
+|------|---------|
+| `dev_info` | Report the running executable's path and mtime, version, enabled features, target and uptime. |
+
+The problem it solves: an MCP server over stdio never hot-reloads. Rebuilding
+replaces the file on disk, but the client keeps talking to the process it
+already spawned, so until that connection is restarted the server answering is
+still the old build &ndash; and rereading the source will never reveal it. This
+gets worse under a launcher that runs the binary from a snapshot copy &ndash; one
+way to keep the build directory writable while the server holds a binary open
+&ndash; because then the running file is not even the one just built.
+
+`dev_info` makes the running image state its own identity:
+
+```
+tui_mcp 1.2.1
+  executable:       /home/dev/tui_mcp/target/debug/tui_mcp
+  binary mtime:     2026-09-05 17:21:18 UTC (2m26s ago)
+  started:          2026-09-05 17:23:45 UTC (0s ago)
+  features:         dev-tools
+  target:           x86_64 linux (gnu)
+  family:           unix
+  debug_assertions: on
+  protocol:         MCP 2025-03-26
+```
+
+`binary mtime` identifies which build is running &ndash; compare it against when
+you last built. Timestamps are UTC, so they also compare directly against file
+listings and logs from any machine.
+
+Read the label literally: it is the mtime of the file at the executable's path,
+not of the loaded image. Those diverge as soon as a rebuild replaces or removes
+that file, and on Linux the divergence is the clearest reading of all. Cargo
+does not overwrite the binary in place; it unlinks it and links a fresh one, so
+a server still running the old build reports:
+
+```
+  executable:       /home/dev/tui_mcp/target/debug/tui_mcp (deleted)
+  binary mtime:     <unavailable>
+  started:          2026-09-05 17:26:15 UTC (1m58s ago)
+```
+
+The `(deleted)` suffix is the kernel's own annotation on `/proc/pid/exe` for a
+path that has been unlinked, and it says outright that this process is serving a
+binary no longer on disk.
+
+Where a rebuild leaves the running file untouched &ndash; a snapshot launcher, or
+any platform that will not unlink a mapped image &ndash; nothing in the output
+flags a stale process, and the mtime is the only clue: it will name the build
+you made before last.
+
+The behavior above was checked on Linux and Windows. macOS is untested: it
+resolves the executable's path by a different mechanism than Linux does, so
+which of the two readings a stale process gets there is unconfirmed.
+
 ## Register with an MCP client
 
 `tui_mcp` speaks MCP over stdio, so any MCP-capable client can run it. Point the

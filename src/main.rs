@@ -7,6 +7,8 @@
 // Shared with build.rs, which stamps it as the exe's FileDescription.
 include!("display_name.rs");
 
+#[cfg(feature = "dev-tools")]
+mod dev_tools;
 mod keys;
 mod kitty;
 mod mouse;
@@ -302,6 +304,14 @@ struct SleepArgs {
 struct TuiServer {
     sessions: SessionManager,
     tool_router: ToolRouter<Self>,
+    /// When this server was constructed, reported by `dev_info` as uptime.
+    ///
+    /// Stands in for the process start time, which it trails by however long
+    /// argument parsing and logger setup take -- microseconds. Asking the OS for
+    /// the real value would mean a separate implementation per platform to
+    /// sharpen a number that is only ever read as "minutes ago" or "hours ago".
+    #[cfg(feature = "dev-tools")]
+    started_at: std::time::SystemTime,
 }
 
 fn reply(text: impl Into<String>) -> CallToolResult {
@@ -447,8 +457,20 @@ impl TuiServer {
     fn new() -> Self {
         Self {
             sessions: SessionManager::new(),
-            tool_router: Self::tool_router(),
+            tool_router: Self::router(),
+            #[cfg(feature = "dev-tools")]
+            started_at: std::time::SystemTime::now(),
         }
+    }
+
+    /// The full tool set: the tools below, plus the `dev-tools` ones when that
+    /// feature is on. Those arrive as a second router; `crate::dev_tools`
+    /// explains why they cannot live in this impl block.
+    fn router() -> ToolRouter<Self> {
+        let router = Self::tool_router();
+        #[cfg(feature = "dev-tools")]
+        let router = router + Self::dev_tool_router();
+        router
     }
 
     #[tool(
