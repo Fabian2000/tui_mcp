@@ -1,53 +1,193 @@
 # tui_mcp
 
-An MCP server for remote-controlling and observing TUI programs. It runs a
-program under a real PTY with an embedded terminal emulator (`vt100`). You drive
-the program with simulated keyboard and mouse input, and read the rendered
-screen back as text. This works even when the program toggles raw mode, switches
-to the alternate screen, or restarts a child at runtime.
+MCP server for driving and watching terminal programs.
 
-## Why a PTY plus emulator
+You start a program under a real PTY. The server feeds that program's output into an embedded `vt100` emulator and keeps the screen grid it builds. Tools send keyboard and mouse input, then read the grid back as text. Your own terminal stays untouched. Raw mode, the alternate screen, and a program that exits and starts another child are byte streams the emulator already understands.
 
-You never touch the controlling terminal. The program writes bytes to a pseudo
-terminal, and those bytes are fed to a `vt100` parser that keeps a virtual
-screen grid. Reading the screen just dumps that grid. That sidesteps the usual
-raw-mode testing pain. Raw and cooked toggles, alternate-screen switches, and
-programs that come and go are all just byte streams the emulator already
-understands.
+The server speaks MCP over stdio and opens no network ports.
 
-## Build
+## Install and register
 
 ```bash
 cargo build --release
 ```
 
-## Development build
+Point the client at the binary you just built, using its absolute path. On Windows that file is `target\release\tui_mcp.exe`. Elsewhere it is `target/release/tui_mcp`.
 
-The `dev-tools` feature adds tooling that exists only to support work on
-`tui_mcp` itself. It is off by default, so a released binary never carries it:
+JSON config, used by Claude Code, Cursor, VS Code, Windsurf, and others:
+
+```json
+{
+  "mcpServers": {
+    "tui": { "command": "/path/to/tui_mcp/target/release/tui_mcp" }
+  }
+}
+```
+
+TOML config. For the Codex CLI, add this to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.tui]
+command = "/path/to/tui_mcp/target/release/tui_mcp"
+```
+
+Some clients can write the entry for you:
+
+```bash
+# Claude Code
+claude mcp add tui -- /path/to/tui_mcp/target/release/tui_mcp
+
+# Codex CLI
+codex mcp add tui -- /path/to/tui_mcp/target/release/tui_mcp
+```
+
+Check the client's docs for the exact file and format.
+
+## A typical session
+
+1. `session_start` with a name and a command.
+2. `wait_for_text` or `wait_for_stable` until the UI is ready.
+3. `send_key`, `send_keys`, `send_text`, `paste`, or `send_mouse`.
+4. `read_screen` to see what happened.
+5. `session_stop` when you are done. `session_purge` removes every session whose program has already exited.
+
+## Tools
+
+| Tool | Purpose |
+|------|---------|
+| `session_start` | Spawn a program. `mode: "pty"` (default, real TUI) or `"piped"` (separate stdout/stderr, no TTY). |
+| `session_list` | List sessions with kind, command, cwd, and exit status. |
+| `session_stop` | Kill and remove a session. |
+| `session_purge` | Remove all sessions whose program has already exited. |
+| `signal` | Send an OS signal (`INT`, `TERM`, `HUP`, `TSTP`, `CONT`, `WINCH`, `USR1`, ...) to a session's process. Unix only. |
+| `send_key` | Named key plus ctrl/alt/shift modifiers, with an optional repeat `count`. |
+| `send_keys` | A sequence of key presses in one call, such as `["ctrl+c", "enter"]`. Optional `delay_ms`. |
+| `send_text` | Type literal text. Optional `delay_ms` paces the characters. |
+| `paste` | Paste multi-line text. Wraps it in bracketed-paste markers when the program has enabled that mode. |
+| `send_bytes` | Raw bytes, with `\n` `\r` `\t` `\e` `\xHH` escapes, for input the key and mouse tools do not cover. |
+| `send_mouse` | Click, scroll, drag, or hover at 1-based `(x, y)`, using SGR mouse reporting. `count` repeats the action (`count: 2` is a double-click). `delay_ms` spaces the repeats. |
+| `read_screen` | Dump the PTY screen as text or ANSI, with size and cursor. This is the one to use by default. |
+| `screenshot` | PNG of the PTY screen, for color and layout checks. Costs far more tokens than `read_screen`. |
+| `screenshot_to_file` | Write that PNG to a file and return a short confirmation. For a person or for docs, since it spends no image tokens. Never overwrites: on a name collision it writes an indexed name such as `shot(1).png`. |
+| `read_scrollback` | Paged scrollback (the visible screen plus lines that scrolled off), with line numbers. |
+| `search_scrollback` | Regex search over scrollback. Returns matching lines, with optional context. |
+| `read_output` | Read buffered stdout or stderr of a piped session. `clear` drains the buffer. |
+| `close_stdin` | Send EOF to a piped program. |
+| `resize` | Resize a PTY (`cols` by `rows`). |
+| `wait_for_text` | Block until text appears. `regex` matches a pattern. `absent` waits until it disappears. `format` chooses the returned screen: `none`, `text`, or `ansi`. |
+| `wait_for_stable` | Block until the screen stops changing, or until timeout. `format` is `none`, `text`, or `ansi`. |
+| `wait_for_change` | Block until the screen differs from its current contents. `format` is `none`, `text`, or `ansi`. If it never changes, the result is the status line alone. |
+| `wait_for_exit` | Block until the program exits. Returns the exit status for a PTY or a piped session. |
+| `wait_for_output` | Block until a piped session's stdout or stderr contains text or a regex match. |
+| `sleep` | Fixed wait. Capped by `max_ms`, and never longer than 60 seconds. |
+
+## Sessions
+
+`session_start` runs the command in one of two modes.
+
+| Mode | When to use it |
+|------|----------------|
+| `pty` (default) | Real terminal, for TUIs. Default size is 80 columns by 24 rows. |
+| `piped` | Separate stdout and stderr, no TTY. For ordinary commands. |
+
+`signal` can deliver `INT`, `TERM`, `HUP`, `TSTP`, `CONT`, `WINCH`, `USR1`, and other OS signals. Unix only.
+
+## Keyboard, mouse, and paste
+
+### Key names
+
+A key is a single character, or one of `enter`, `tab`, `esc`, `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`, `up`, `down`, `left`, `right`, `f1` through `f12`, `space`.
+
+Modifiers are `ctrl`, `alt`, and `shift`. For example, `key="c"` with `modifiers=["ctrl"]`.
+
+`send_keys` takes the same names with modifiers joined by `+`, such as `["ctrl+c", "enter", "alt+shift+f"]`. `delay_ms` pauses between presses. On `send_text`, `delay_ms` pauses between characters, which helps programs that drop a fast burst.
+
+### Kitty keyboard protocol
+
+If a program enables the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/), the server sees the flags query on the program's output and answers it, so the program actually turns the protocol on. `send_key` then encodes modified keys in Kitty form. `Ctrl+C` goes out as `CSI 99;5u`, which keeps that chord distinct from a plain `C`. The tool result includes `(kitty)` when this encoding was used.
+
+Arrows, F-keys, Home, and End keep their usual CSI sequences. A program that never enables the protocol still receives legacy xterm encoding.
+
+### Multi-line paste
+
+Typing a multi-line block with `send_text` is a series of keystrokes. Editors auto-indent each line, and a leading character can run a command.
+
+`paste` sends the block as one paste. When the program has enabled bracketed paste (`CSI ? 2004 h`), the server wraps the text in `ESC[200~` ... `ESC[201~`, and editors such as vim and nano insert it verbatim. If that mode is off, `paste` sends the text as plain input and says so in the result.
+
+### Mouse
+
+`send_mouse` clicks, scrolls, drags, or hovers at a 1-based `(x, y)` with SGR mouse reporting. `count: 2` is a double-click. `delay_ms` spaces repeated actions. `resize` sets the PTY to `cols` by `rows`.
+
+## Reading output
+
+### Text and screenshots
+
+`read_screen` returns plain text, plus the size and cursor. Use it unless you specifically need color. `format: "ansi"` adds ANSI color and attribute escapes.
+
+`screenshot` renders the same grid to a PNG with the real foreground and background colors. That image costs many more tokens, so keep it for a color or layout question that the text cannot answer.
+
+`screenshot_to_file` writes the same PNG and returns a short confirmation, which spends no image tokens. Use it when the picture is for a person or for documentation. If the path already exists, the file is saved under an indexed name (`shot(1).png`, `shot(2).png`, ...) and the result names the path that was written.
+
+### Hyperlinks
+
+When a program emits OSC 8 hyperlinks, `format: "ansi"` adds a `Hyperlinks:` footnote. The footnote lists URIs whose display text is currently on screen. Links are matched by that display text, because the emulator does not track the cell they occupy. A link drops out of the footnote as soon as a later read no longer finds its text. The same words showing up on another line later do not bring it back.
+
+### Scrollback
+
+The visible screen is only `rows` by `cols`. Lines that scroll off the top stay in a 5,000-line buffer.
+
+`read_scrollback` returns that history one page at a time. The default page is 100 lines, most recent first, with line numbers, so a long history does not flood the context.
+
+`search_scrollback` runs a regex over the whole buffer and returns the matching lines, with optional surrounding context.
+
+Full-screen programs such as vim and htop usually leave this buffer empty. Read those with `read_screen`.
+
+### Piped stdout and stderr
+
+Each piped session keeps stdout and stderr in a ring buffer, 2 MiB per stream by default. `buffer_bytes` on `session_start` changes the cap. Once a stream grows past the cap, the oldest bytes are dropped. The next `read_output` starts with a notice like this, so a short buffer is obvious:
+
+```
+[tui_mcp: N earlier byte(s) dropped ...]
+```
+
+For a long-running program that prints often, call `read_output` frequently and pass `clear: true` to drain what you just read. `close_stdin` sends EOF. `wait_for_output` blocks until stdout or stderr contains a string or a regex match.
+
+## Waiting
+
+`wait_for_text`, `wait_for_stable`, and `wait_for_change` take a `format` that chooses the payload once the wait ends.
+
+| `format` | Result |
+|----------|--------|
+| `text` | Plain-text screen. This is the default, and omitting `format` does the same thing. |
+| `ansi` | The screen with ANSI color and attribute escapes, same as `read_screen` with `format: "ansi"`. |
+| `none` | The outcome line only. Examples: `matched in ~40ms`, `gone in ~40ms`, `changed in ~40ms`, `stable in ~350ms`, or a `TIMEOUT ...` line. Use this when you only need the wait to finish. |
+
+Matching always uses the plain-text screen, so `format` changes the payload and leaves the match condition alone. `text` and `ansi` are captured from the frame that satisfied the wait. A UI that redraws immediately cannot substitute a later frame.
+
+A successful result includes how long the wait took (`in ~{N}ms`). The clock starts when the tool begins polling, and the number is rounded to the poll interval. Treat it as a rough latency from the call.
+
+`wait_for_text` accepts `regex` for a pattern, and `absent` to wait until the text is gone.
+
+On `wait_for_change`, a timeout means the screen still matches what you already had. The result is the outcome line alone, for every `format`. The unchanged screen is left out.
+
+`wait_for_exit` returns the exit status for either session kind. `sleep` waits a fixed time, limited by `max_ms`, with a hard cap of 60 seconds.
+
+## Development builds
+
+`dev-tools` exists for work on `tui_mcp` itself. Release builds leave it off, so a published binary does not include it.
 
 ```bash
 cargo build --features dev-tools
 ```
 
-It currently adds one tool:
+The feature adds `dev_info`, which reports the running executable's path and mtime, plus version, enabled features, target, and uptime.
 
-| Tool | Purpose |
-|------|---------|
-| `dev_info` | Report the running executable's path and mtime, version, enabled features, target and uptime. |
+A server on stdio does not pick up a rebuild by itself. Cargo replaces the file on disk, and the client keeps talking to the process it already spawned. A launcher that starts a snapshot copy makes this easier to miss, because the live process is a different file from the one you just built. `dev_info` asks that process to name itself.
 
-The problem it solves: an MCP server over stdio never hot-reloads. Rebuilding
-replaces the file on disk, but the client keeps talking to the process it
-already spawned, so until that connection is restarted the server answering is
-still the old build &ndash; and rereading the source will never reveal it. This
-gets worse under a launcher that runs the binary from a snapshot copy &ndash; one
-way to keep the build directory writable while the server holds a binary open
-&ndash; because then the running file is not even the one just built.
-
-`dev_info` makes the running image state its own identity:
+Sample output:
 
 ```
-tui_mcp 1.2.1
+tui_mcp 1.3.0
   executable:       /home/dev/tui_mcp/target/debug/tui_mcp
   binary mtime:     2026-09-05 17:21:18 UTC (2m26s ago)
   started:          2026-09-05 17:23:45 UTC (0s ago)
@@ -58,15 +198,11 @@ tui_mcp 1.2.1
   protocol:         MCP 2025-03-26
 ```
 
-`binary mtime` identifies which build is running &ndash; compare it against when
-you last built. Timestamps are UTC, so they also compare directly against file
-listings and logs from any machine.
+`binary mtime` is the modification time of the file at the executable's path. Compare it with the time of your last build. Timestamps are UTC, so they line up with file listings and logs from any machine.
 
-Read the label literally: it is the mtime of the file at the executable's path,
-not of the loaded image. Those diverge as soon as a rebuild replaces or removes
-that file, and on Linux the divergence is the clearest reading of all. Cargo
-does not overwrite the binary in place; it unlinks it and links a fresh one, so
-a server still running the old build reports:
+The timestamp follows that path. It matches the loaded image only while the file there is still the one this process started from. A rebuild that replaces or removes the file splits the two apart.
+
+On Linux the split is easy to see. Cargo unlinks the old binary and links a new one, so a process still running the old build reports:
 
 ```
   executable:       /home/dev/tui_mcp/target/debug/tui_mcp (deleted)
@@ -74,196 +210,15 @@ a server still running the old build reports:
   started:          2026-09-05 17:26:15 UTC (1m58s ago)
 ```
 
-The `(deleted)` suffix is the kernel's own annotation on `/proc/pid/exe` for a
-path that has been unlinked, and it says outright that this process is serving a
-binary no longer on disk.
+`(deleted)` is the kernel's note on `/proc/<pid>/exe` once that path has been unlinked. The process is serving a binary that is no longer a file on disk, which is why `binary mtime` is unavailable.
 
-Where a rebuild leaves the running file untouched &ndash; a snapshot launcher, or
-any platform that will not unlink a mapped image &ndash; nothing in the output
-flags a stale process, and the mtime is the only clue: it will name the build
-you made before last.
+A snapshot launcher, or any platform that leaves the mapped file in place, keeps the path as it was. Nothing in the output then marks the process as stale. The mtime is the clue, and it will be the build from before last.
 
-The behavior above was checked on Linux and Windows. macOS is untested: it
-resolves the executable's path by a different mechanism than Linux does, so
-which of the two readings a stale process gets there is unconfirmed.
+The readings above were checked on Linux and Windows. macOS resolves the executable path by a different mechanism, so which of the two readings a stale process gets there is still unknown.
 
-## Register with an MCP client
+## Security
 
-`tui_mcp` speaks MCP over stdio, so any MCP-capable client can run it. Point the
-client at the binary you built, using the absolute path to
-`target/release/tui_mcp`. Configure it the way your client expects. Two common
-formats are shown below.
-
-Many clients (Claude Code, Cursor, VS Code, Windsurf, and others) use a JSON
-config that lists MCP servers:
-
-```json
-{
-  "mcpServers": {
-    "tui": { "command": "/path/to/tui_mcp/target/release/tui_mcp" }
-  }
-}
-```
-
-Others use a TOML config. For the Codex CLI, add this to `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.tui]
-command = "/path/to/tui_mcp/target/release/tui_mcp"
-```
-
-Some clients also provide a command-line helper that writes the config for you:
-
-```bash
-# Claude Code
-claude mcp add tui -- /path/to/tui_mcp/target/release/tui_mcp
-
-# Codex CLI
-codex mcp add tui -- /path/to/tui_mcp/target/release/tui_mcp
-```
-
-Check your client's own documentation for the exact location and format.
-
-## Tools
-
-| Tool | Purpose |
-|------|---------|
-| `session_start` | Spawn a program. `mode: "pty"` (default, real TUI) or `"piped"` (separate stdout/stderr, no TTY). |
-| `session_list` | List sessions with kind, command, cwd and exit status. |
-| `session_stop` | Kill and remove a session. |
-| `session_purge` | Remove all sessions whose program has already exited. |
-| `signal` | Send an OS signal (INT, TERM, HUP, TSTP, CONT, WINCH, USR1, ...) to a session's process (Unix). |
-| `send_key` | Named key plus ctrl/alt/shift modifiers, optional repeat `count`. |
-| `send_keys` | A sequence of key presses in one call, e.g. `["ctrl+c", "enter"]` (optional `delay_ms`). |
-| `send_text` | Type literal text (optional `delay_ms` to pace characters). |
-| `paste` | Paste multi-line text. Wraps in bracketed-paste markers when the program enabled the mode. |
-| `send_bytes` | Raw bytes with `\n \r \t \e \xHH` escapes, for anything the key and mouse tools don't cover. |
-| `send_mouse` | Click, scroll, drag, or hover at 1-based `(x, y)` (SGR mouse reporting). `count` repeats the action (`count: 2` = double-click); `delay_ms` spaces the repeats. |
-| `read_screen` | Dump the pty screen as text or ANSI, with size and cursor. Preferred and cheapest. |
-| `screenshot` | PNG of the pty screen for color and layout checks. Costlier, so use it only when colors matter. |
-| `screenshot_to_file` | Write a PNG of the pty screen to a file and return a short confirmation, for the user or documentation. Never overwrites: uses an indexed name like `shot(1).png` on collision. |
-| `read_scrollback` | Paged scrollback history (visible plus scrolled-off lines) with line numbers. |
-| `search_scrollback` | Regex search over scrollback. Returns matching lines with optional context. |
-| `read_output` | Read buffered stdout/stderr of a piped session (`clear` to drain). |
-| `close_stdin` | Send EOF to a piped program. |
-| `resize` | Resize a pty (cols by rows). |
-| `wait_for_text` | Block until text appears on screen. `regex` matches a pattern, `absent` waits for it to disappear. `format` controls the returned screen (`none`/`text`/`ansi`). |
-| `wait_for_stable` | Block until the screen stops changing (with timeout). `format` controls the returned screen (`none`/`text`/`ansi`). |
-| `wait_for_change` | Block until the screen changes from its current contents. `format` controls the returned screen (`none`/`text`/`ansi`). If screen is not changed &ndash; just returns status line. |
-| `wait_for_exit` | Block until the program exits. Returns the exit status (pty or piped). |
-| `wait_for_output` | Block until a piped session's stdout/stderr contains text or a regex match. |
-| `sleep` | Fixed wait, capped by `max_ms` (hard cap 60 s). |
-
-## Kitty keyboard protocol
-
-If a program enables the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
-(as some modern TUIs do), the server notices it on the program's output stream
-and answers the flags query so the program actually turns it on. `send_key` then
-encodes keys in the kitty form, so `Ctrl+C` becomes `CSI 99;5u`. That cleanly
-disambiguates modified keys. Programs that do not use it are unaffected and get
-the legacy xterm encoding. Functional keys such as arrows, F-keys, and Home/End
-keep their standard CSI forms. `send_key` adds `(kitty)` to its result when it
-used the kitty encoding.
-
-## Pasting multi-line text
-
-Typing a multi-line block with `send_text` makes editors treat each line as
-keystrokes. Auto-indent then shifts your code, and leading characters can
-trigger commands. The `paste` tool avoids that. The server notices when a
-program has enabled bracketed paste mode (`CSI ? 2004 h` on its output) and wraps
-the text in `ESC[200~ ... ESC[201~`, so editors like vim and nano insert it
-verbatim. If the program has not enabled the mode, `paste` sends the text as-is
-and says so in its result.
-
-## Key names
-
-Single characters, or one of: `enter`, `tab`, `esc`, `backspace`, `delete`,
-`insert`, `home`, `end`, `pageup`, `pagedown`, `up`, `down`, `left`, `right`,
-`f1` through `f12`, `space`. Modifiers combine, for example
-`key="c", modifiers=["ctrl"]`.
-
-## Reading the screen: text vs screenshot
-
-`read_screen` returns plain text and is the cheapest way to observe a TUI, so use
-it by default. `screenshot` renders the screen to a PNG with the real foreground
-and background colors, which costs far more tokens. Reach for it only when a
-color or layout question cannot be answered from text alone.
-
-`screenshot_to_file` writes the same PNG to a file and returns only a short
-confirmation, so it spends no image tokens. Use it when the picture is for a
-human or for documentation rather than for the model. It never overwrites an
-existing file: it adds `(1)`, `(2)`, ... to the name instead and reports the
-path it wrote.
-
-When a program emits OSC 8 hyperlinks, `format: "ansi"` appends a `Hyperlinks:`
-footnote listing the URIs of links whose text is currently on screen. This is
-best effort: links are matched back to the screen by their display text, since
-the emulator does not track their exact position. A link is forgotten as soon as
-a read no longer finds its text, so a link that has scrolled away will not
-reappear later just because another line happens to contain the same words.
-
-## Wait tools: returning the screen
-
-`wait_for_text`, `wait_for_stable`, and `wait_for_change` take an optional
-`format` that says what to return once the wait resolves:
-
-- `none` — the outcome only (e.g. `matched in ~40ms` / `gone in ~40ms` /
-  `changed in ~40ms` / `stable in ~350ms`, or a `TIMEOUT ...` line). No screen
-  payload. Use it when the call is pure synchronization and the screen would be
-  discarded.
-- `text` — the plain-text screen (the default; omitting `format` is unchanged
-  behavior).
-- `ansi` — the screen with ANSI color/attribute escapes, like
-  `read_screen { format: "ansi" }`.
-
-Matching always runs on the plain-text screen, so the `format` value never
-changes *whether* the wait matches — only what comes back. `text`/`ansi` capture
-the screen from the same frame that satisfied the wait, so the returned ANSI is
-guaranteed to be the state that matched (no separate `read_screen` race on UIs
-that redraw quickly).
-
-A successful outcome carries how long the wait took (`in ~{N}ms`). It is
-approximate — measured from when the tool started polling, not from any earlier
-input, and rounded to the poll granularity — so treat it as a rough latency
-signal, not an exact reaction time.
-
-For `wait_for_change`, a timeout means the screen never changed, so it still
-equals what the caller already had. In that case the timeout returns the outcome
-line alone regardless of `format` — the unchanged screen is never echoed back.
-
-## Scrollback
-
-The visible screen is only `rows` by `cols`. Lines that scroll off the top are
-kept in an internal scrollback buffer of 5000 lines. `read_scrollback` returns
-that history one page at a time (100 lines per page by default, most recent
-first) so it does not flood context. `search_scrollback` runs a regex over the
-whole history and returns just the matching lines. Full-screen TUIs like vim and
-htop usually have no scrollback, so use `read_screen` there.
-
-## Output buffering (piped mode)
-
-Each piped session keeps its stdout and stderr in a bounded ring buffer, 2 MiB
-per stream by default and configurable with `buffer_bytes` on `session_start`.
-If a program produces more than that between reads, the oldest bytes are dropped.
-`read_output` then prepends a notice like
-`[tui_mcp: N earlier byte(s) dropped ...]` so the truncated output is never
-mistaken for the program's complete output. For chatty long-running programs,
-read often and pass `clear: true`.
-
-## Security model
-
-This server runs whatever commands the connected client asks it to, in the
-server's own user account, environment, and working directory. That is the whole
-point of it. Only connect it to clients you trust, and run it with no more
-privilege than the tasks need. It opens no network ports of its own.
-
-## Typical flow
-
-1. `session_start { name, command }`
-2. `wait_for_text` or `wait_for_stable` to sync
-3. `send_key`, `send_keys`, `send_text`, or `send_mouse`
-4. `read_screen` to observe
-5. `session_stop` (or `session_purge`) when done
+The server runs whatever command the connected client asks for, as the user account that started it, with that process's environment and working directory. That is what it is for. Connect it only to clients you trust, and run it with no more privilege than the task needs. It opens no network ports of its own.
 
 ## License
 
@@ -272,6 +227,6 @@ Dual-licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
-at your option. The bundled font `assets/DejaVuSansMono.ttf` is distributed
-under the Bitstream Vera license. See
-[`assets/DejaVuSansMono.LICENSE.txt`](assets/DejaVuSansMono.LICENSE.txt).
+at your option.
+
+The bundled font `assets/DejaVuSansMono.ttf` is distributed under the Bitstream Vera license. See [`assets/DejaVuSansMono.LICENSE.txt`](assets/DejaVuSansMono.LICENSE.txt).
