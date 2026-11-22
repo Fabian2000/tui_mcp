@@ -58,6 +58,21 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 const DEFAULT_CONTEXT_LINES: usize = 0;
 const MAX_SLEEP_MS: u64 = 60_000;
 
+/// Wait between the text and the Enter of `send_text` with `submit`.
+///
+/// Some programs whose input box takes multi-line text need a pause before
+/// the Enter: when the text and the Enter arrive within one read, they take
+/// the burst as typed or pasted text and keep the Enter as a line break
+/// instead of submitting. Measured 2026-11-23 with the Claude Code TUI
+/// (2.1.330) on Windows 11 (ConPTY) and on WSL2 Ubuntu 24.04, prompts of
+/// about 120 to 5,700 characters: with the Enter written separately but
+/// right after the text, all 9 trials failed to submit (the Enter landed in
+/// the input box as a newline, or as part of a paste); with a wait of 5, 20
+/// or 50 ms, all 32 submitted. 20 ms keeps a margin over the 5 ms that
+/// already worked. Microsoft Edit, GNU nano and the Antigravity CLI took the
+/// Enter correctly even in the same write as the text.
+const SUBMIT_WAIT_MS: u64 = 20;
+
 #[derive(Deserialize, JsonSchema)]
 struct StartArgs {
     /// Unique name to refer to this session in later calls.
@@ -144,6 +159,13 @@ struct SendTextArgs {
     #[serde(default)]
     #[schemars(extend("default" = DEFAULT_DELAY_MS))]
     delay_ms: Option<u64>,
+    /// Also press Enter after the text, written separately after a short pause,
+    /// so the program submits the line. Prefer this to ending `text` with a
+    /// newline, which some programs take as part of the text instead of a
+    /// submit.
+    #[serde(default)]
+    #[schemars(extend("default" = false))]
+    submit: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -791,7 +813,8 @@ impl TuiServer {
 
     #[tool(
         description = "Type literal text into the program (no special-key handling). Set \
-        delay_ms to pace the characters for programs that drop fast input."
+        delay_ms to pace the characters for programs that drop fast input. Set submit=true \
+        to press Enter afterwards."
     )]
     async fn send_text(
         &self,
@@ -815,7 +838,25 @@ impl TuiServer {
                     .map_err(|e| err(&e))?;
             }
         }
-        Ok(reply("text sent"))
+        if !a.submit.unwrap_or(false) {
+            return Ok(reply("text sent"));
+        }
+        // As on the delay_ms paths, the session lock is released during the
+        // wait, so a concurrent write to the same session can land between the
+        // text and the Enter.
+        tokio::time::sleep(std::time::Duration::from_millis(SUBMIT_WAIT_MS)).await;
+        // Same bytes as `send_key enter`: kitty-encoded when the program enabled
+        // it, `\n` in pipes mode.
+        self.sessions
+            .with(&a.name, |s| {
+                let bytes =
+                    key_bytes_for(s, "enter", Mods::default()).expect("enter is a known key");
+                write_session(s, &bytes)
+            })
+            // The error reports that the text is already typed, so the caller
+            // retries only the Enter instead of typing the text twice.
+            .map_err(|e| err(&anyhow::anyhow!("text sent, but Enter failed: {e}")))?;
+        Ok(reply("text sent, then Enter"))
     }
 
     #[tool(
@@ -1777,6 +1818,84 @@ mod tests {
         assert_eq!(out, format!("{cycle}{cycle}"));
 
         srv.sessions.remove("catsess").ok();
+    }
+
+    /// Fails if `send_text` with `submit` writes the text and the Enter in one
+    /// write, drops the wait between them, or sends an Enter other than `\n`
+    /// to a piped session; see `SUBMIT_WAIT_MS` for why they are separate.
+    /// As in the `send_mouse` delay test below, the future is driven only
+    /// partway, parked on its wait, to see the text echoed without the Enter.
+    /// Unix-only, same reasons as the count test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_text_submit_appends_enter() {
+        let srv = TuiServer::new();
+        srv.session_start(Parameters(StartArgs {
+            name: "catsess".into(),
+            command: "cat".into(),
+            args: vec![],
+            cwd: None,
+            env: HashMap::new(),
+            cols: None,
+            rows: None,
+            mode: Some("piped".into()),
+            buffer_bytes: None,
+        }))
+        .await
+        .unwrap();
+
+        let read_stdout = || {
+            srv.sessions
+                .with("catsess", |s| match s {
+                    Session::Piped(p) => Ok(p.read_stream(Stream::Stdout, false)),
+                    Session::Pty(_) => unreachable!("started as piped"),
+                })
+                .unwrap()
+        };
+
+        let fut = srv.send_text(Parameters(SendTextArgs {
+            name: "catsess".into(),
+            text: "hi".into(),
+            delay_ms: None,
+            submit: Some(true),
+        }));
+        tokio::pin!(fut);
+
+        // Poll once, racing a timer shorter than SUBMIT_WAIT_MS: the future
+        // writes the text and parks on its wait (see the `send_mouse` delay
+        // test for why `biased` and the pinned `&mut`).
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(std::time::Duration::from_millis((SUBMIT_WAIT_MS / 4).max(1))) => {}
+            _ = &mut fut => panic!("send_text returned before its submit wait elapsed"),
+        }
+
+        // cat echoes the text; the Enter cannot be written while the future
+        // is parked, so the buffer must hold the text alone.
+        let mut mid = String::new();
+        for _ in 0..40 {
+            mid = read_stdout();
+            if mid.contains("hi") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(mid, "hi");
+
+        let r = fut.await.unwrap();
+        let reply = r.content[0].as_text().map(|t| t.text.as_str());
+        assert_eq!(reply, Some("text sent, then Enter"));
+
+        let mut out = String::new();
+        for _ in 0..40 {
+            out = read_stdout();
+            if out.ends_with('\n') {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        srv.sessions.remove("catsess").ok();
+        assert_eq!(out, "hi\n");
     }
 
     /// With a non-zero `delay_ms`, `send_mouse` must emit the first click cycle,

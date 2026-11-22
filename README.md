@@ -135,7 +135,7 @@ Check your client's own documentation for the exact location and format.
 | `signal` | Send an OS signal (INT, TERM, HUP, TSTP, CONT, WINCH, USR1, ...) to a session's process. On Windows only `INT` works, in pty mode: it types Ctrl+C (byte `0x03`). |
 | `send_key` | Named key plus ctrl/alt/shift modifiers, optional repeat `count`. |
 | `send_keys` | A sequence of key presses in one call, e.g. `["ctrl+c", "enter"]` (optional `delay_ms`). |
-| `send_text` | Type literal text (optional `delay_ms` to pace characters). |
+| `send_text` | Type literal text (optional `delay_ms` to pace characters, `submit` to press Enter afterwards). |
 | `paste` | Paste multi-line text. Wraps in bracketed-paste markers when the program enabled the mode. |
 | `send_bytes` | Raw bytes with `\n \r \t \e \xHH` escapes, for anything the key and mouse tools don't cover. |
 | `send_mouse` | Click, scroll, drag, or hover at 1-based `(x, y)` (SGR mouse reporting). `count` repeats the action (`count: 2` = double-click); `delay_ms` spaces the repeats. |
