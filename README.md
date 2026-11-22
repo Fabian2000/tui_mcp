@@ -129,7 +129,7 @@ Check your client's own documentation for the exact location and format.
 | Tool | Purpose |
 |------|---------|
 | `session_start` | Spawn a program. `mode: "pty"` (default, real TUI) or `"piped"` (separate stdout/stderr, no TTY). |
-| `session_list` | List sessions with kind, command, cwd and exit status. |
+| `session_list` | List sessions with kind, command, cwd and exit status (`running`, `exit code: N`, or on Unix `signal: ...`). |
 | `session_stop` | Kill and remove a session. |
 | `session_purge` | Remove all sessions whose program has already exited. |
 | `signal` | Send an OS signal (INT, TERM, HUP, TSTP, CONT, WINCH, USR1, ...) to a session's process (Unix). |
@@ -150,7 +150,7 @@ Check your client's own documentation for the exact location and format.
 | `wait_for_text` | Block until text appears on screen. `regex` matches a pattern, `absent` waits for it to disappear. `format` controls the returned screen (`none`/`text`/`ansi`). |
 | `wait_for_stable` | Block until the screen stops changing (with timeout). `format` controls the returned screen (`none`/`text`/`ansi`). |
 | `wait_for_change` | Block until the screen changes from its current contents. `format` controls the returned screen (`none`/`text`/`ansi`). If screen is not changed &ndash; just returns status line. |
-| `wait_for_exit` | Block until the program exits. Returns the exit status (pty or piped). |
+| `wait_for_exit` | Block until the program exits. Returns the exit status: `exit code: N` in both modes, or on Unix `signal: ...` (pty: the signal's description, piped: its number and name). |
 | `wait_for_output` | Block until a piped session's stdout/stderr contains text or a regex match. |
 | `sleep` | Fixed wait, capped by `max_ms` (hard cap 60 s). |
 

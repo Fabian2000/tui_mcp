@@ -150,6 +150,18 @@ fn build_command(opts: &SpawnOpts) -> CommandBuilder {
     cmd
 }
 
+/// How a program that exited on its own is reported, the same for pty and
+/// piped sessions: `exit code: 3`. A code with the high bit set is a Windows
+/// NTSTATUS (0xC000013A after Ctrl+C, 0xC0000005 after a crash) and is shown
+/// in hex, as std does on Windows, since it is looked up that way.
+fn exit_code_text(code: u32) -> String {
+    if code & 0x8000_0000 == 0 {
+        format!("exit code: {code}")
+    } else {
+        format!("exit code: {code:#x}")
+    }
+}
+
 /// The reply to a cursor-position report request (DSR `CSI 6 n`): the terminal
 /// answers `CSI row;col R`, 1-based. `row`/`col` are the emulator's 0-based
 /// cursor position.
@@ -376,9 +388,16 @@ impl PtySession {
     }
 
     /// Exit status if the child has terminated, `None` if still running.
+    /// Worded like the piped one: see `exit_code_text`.
     pub fn exit_status(&mut self) -> Option<String> {
         match self.child.try_wait() {
-            Ok(Some(status)) => Some(format!("{status:?}")),
+            // portable-pty keeps only `strsignal()`'s description of a signal
+            // ("Killed", "Interrupt"), not its number, and sets the code to a
+            // made-up 1 then, so the code is left out.
+            Ok(Some(status)) => Some(match status.signal() {
+                Some(sig) => format!("signal: {sig}"),
+                None => exit_code_text(status.exit_code()),
+            }),
             _ => None,
         }
     }
@@ -485,9 +504,17 @@ impl PipedSession {
         s
     }
 
+    /// Exit status if the child has terminated, `None` if still running.
+    /// Worded like the pty one: see `exit_code_text`.
     pub fn exit_status(&mut self) -> Option<String> {
         match self.child.try_wait() {
-            Ok(Some(status)) => Some(status.to_string()),
+            // std words an exit code per platform ("exit code: 3" on Windows,
+            // "exit status: 3" on Unix), so only its signal text is kept:
+            // "signal: 9 (SIGKILL)".
+            Ok(Some(status)) => Some(match status.code() {
+                Some(code) => exit_code_text(code.cast_unsigned()),
+                None => status.to_string(),
+            }),
             _ => None,
         }
     }
@@ -671,6 +698,52 @@ mod tests {
         assert_eq!(cursor_position_report(0, 0), "\x1b[1;1R");
         assert_eq!(cursor_position_report(24, 79), "\x1b[25;80R");
     }
+
+    #[test]
+    fn exit_code_text_is_decimal_unless_the_high_bit_is_set() {
+        assert_eq!(exit_code_text(0), "exit code: 0");
+        assert_eq!(exit_code_text(3), "exit code: 3");
+        assert_eq!(exit_code_text(0xC000_013A), "exit code: 0xc000013a");
+    }
+
+    /// Options for a program that exits with code 3 at once.
+    fn exit_3_opts() -> SpawnOpts {
+        #[cfg(windows)]
+        let (command, args) = ("cmd.exe", ["/c", "exit 3"]);
+        #[cfg(unix)]
+        let (command, args) = ("sh", ["-c", "exit 3"]);
+        SpawnOpts {
+            command: command.to_string(),
+            args: args.map(str::to_string).to_vec(),
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 1024,
+        }
+    }
+
+    /// Poll `status` for up to ~5 s until the program has exited.
+    pub(super) fn wait_exited(mut status: impl FnMut() -> Option<String>) -> String {
+        for _ in 0..100 {
+            if let Some(st) = status() {
+                return st;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("program did not exit within 5 s");
+    }
+
+    #[test]
+    fn pty_and_piped_word_an_exit_code_the_same() {
+        let mut pty = PtySession::spawn(&exit_3_opts()).expect("spawn under pty");
+        let pty_status = wait_exited(|| pty.exit_status());
+        let mut piped = PipedSession::spawn(&exit_3_opts()).expect("spawn piped");
+        let piped_status = wait_exited(|| piped.exit_status());
+
+        assert_eq!(pty_status, "exit code: 3");
+        assert_eq!(piped_status, "exit code: 3");
+    }
 }
 
 /// Windows counterpart to `unix_pty_tests`: the same pty behavior, verified
@@ -718,6 +791,31 @@ mod windows_pty_tests {
 #[cfg(all(test, unix))]
 mod unix_pty_tests {
     use super::*;
+
+    /// A program killed by a signal reads `signal: ...` in both modes, with no
+    /// exit code beside it (portable-pty's code is a made-up 1 then).
+    #[test]
+    fn a_signal_death_is_worded_as_a_signal() {
+        let opts = || SpawnOpts {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "kill -9 $$".to_string()],
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 1024,
+        };
+        let mut pty = PtySession::spawn(&opts()).expect("spawn under pty");
+        let pty_status = super::tests::wait_exited(|| pty.exit_status());
+        let mut piped = PipedSession::spawn(&opts()).expect("spawn piped");
+        let piped_status = super::tests::wait_exited(|| piped.exit_status());
+
+        assert!(
+            pty_status.starts_with("signal: ") && !pty_status.contains("code"),
+            "pty: {pty_status:?}"
+        );
+        assert_eq!(piped_status, "signal: 9 (SIGKILL)");
+    }
 
     /// Unix counterpart to `interactive_cmd_renders_under_pty`: a program that
     /// emits a cursor-position request (DSR `CSI 6 n`) on its output must get
