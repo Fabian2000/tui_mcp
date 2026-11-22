@@ -17,6 +17,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::child_env::apply_env;
+
 /// Options shared by both spawn modes.
 pub struct SpawnOpts {
     pub command: String,
@@ -144,9 +146,7 @@ fn build_command(opts: &SpawnOpts) -> CommandBuilder {
     if let Some(cwd) = &opts.cwd {
         cmd.cwd(cwd);
     }
-    for (k, v) in &opts.env {
-        cmd.env(k, v);
-    }
+    apply_env(&mut cmd, &opts.env);
     cmd
 }
 
@@ -406,9 +406,7 @@ impl PipedSession {
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
         }
-        for (k, v) in &opts.env {
-            cmd.env(k, v);
-        }
+        apply_env(&mut cmd, &opts.env);
         let mut child = cmd.spawn().context("failed to spawn piped command")?;
 
         let stdin = child.stdin.take();

@@ -7,6 +7,7 @@
 // Shared with build.rs, which stamps it as the exe's FileDescription.
 include!("display_name.rs");
 
+mod child_env;
 #[cfg(feature = "dev-tools")]
 mod dev_tools;
 mod keys;
@@ -48,7 +49,9 @@ struct StartArgs {
     /// Working directory.
     #[serde(default)]
     cwd: Option<String>,
-    /// Extra environment variables.
+    /// Extra environment variables, set on top of the inherited ones.
+    /// A fixed list of Claude Code's session variables (such as its session id
+    /// and messaging token) is not inherited; set one here to pass it anyway.
     #[serde(default)]
     env: HashMap<String, String>,
     /// Terminal columns (pty mode). Default 80.
