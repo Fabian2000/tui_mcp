@@ -691,6 +691,32 @@ impl SessionManager {
             .with_context(|| format!("failed to send signal to pid {pid}"))?;
         Ok(pid)
     }
+
+    /// Type Ctrl+C into a session's program (Windows, which has no signals).
+    ///
+    /// In a pty, Ctrl+C is the byte 0x03, which ConPTY turns into a
+    /// CTRL_C_EVENT for the console's programs. It is written raw, not through
+    /// the key encoding: once a program enables the kitty keyboard protocol,
+    /// ctrl+c is encoded as `ESC[99;5u`, which interrupted nothing in tests
+    /// (2026-11-22), while a raw 0x03 interrupted console programs and Claude
+    /// Code alike. A pipe has no console to turn the byte into an event, so a
+    /// piped session is refused.
+    #[cfg(not(unix))]
+    pub fn interrupt(&self, name: &str) -> Result<()> {
+        self.with(name, |s| match s {
+            Session::Pty(p) => {
+                // A write to a program that has exited succeeds silently.
+                if p.exit_status().is_some() {
+                    bail!("the program in session '{name}' has already exited");
+                }
+                p.write(&[0x03])
+            }
+            Session::Piped(_) => bail!(
+                "a piped session cannot be interrupted on Windows: start the program \
+                 in pty mode, or use session_stop"
+            ),
+        })
+    }
 }
 
 /// A single session's metadata, as reported by [`SessionManager::list`].

@@ -4,8 +4,8 @@
 //! starts inherits it. Git Bash (MSYS2) sets it for the native programs it
 //! runs, so a server started from there (an MCP client in a Git Bash
 //! terminal, or `cargo test` in one) would pass it on to every session's
-//! program: a Ctrl+C typed into a pty (`send_bytes "\x03"`, `send_key
-//! ctrl+c`) becomes a CTRL_C_EVENT that the program ignores.
+//! program: a Ctrl+C typed into a pty (`signal INT`, `send_bytes "\x03"`,
+//! `send_key ctrl+c`) becomes a CTRL_C_EVENT that the program ignores.
 //! Measured 2026-11-22: `ping -n 30` under a pty was not interrupted when
 //! the server inherited the flag, and was when it didn't.
 //!

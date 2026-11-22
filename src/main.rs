@@ -149,8 +149,12 @@ struct SendTextArgs {
 #[derive(Deserialize, JsonSchema)]
 struct SignalArgs {
     name: String,
-    /// Signal name, e.g. "INT", "TERM", "HUP", "KILL", "TSTP", "CONT",
-    /// "WINCH", "USR1", "USR2" (a leading "SIG" is also accepted).
+    #[cfg_attr(
+        unix,
+        doc = "Signal name, e.g. \"INT\", \"TERM\", \"HUP\", \"KILL\", \"TSTP\", \"CONT\", \
+        \"WINCH\", \"USR1\", \"USR2\" (a leading \"SIG\" is also accepted)."
+    )]
+    #[cfg_attr(not(unix), doc = "Signal name. Only \"INT\" works on Windows.")]
     signal: String,
 }
 
@@ -401,13 +405,25 @@ fn key_bytes_for(session: &session::Session, key: &str, mods: Mods) -> Option<Ve
     })
 }
 
+/// Valid signal names for the `signal` tool, without the "SIG" prefix.
+const SIGNAL_NAMES: [&str; 11] = [
+    "INT", "TERM", "KILL", "HUP", "QUIT", "TSTP", "CONT", "STOP", "WINCH", "USR1", "USR2",
+];
+
+/// A known signal name in its canonical form (upper case, no "SIG" prefix), or
+/// `None` for an unknown one. Platform-neutral, so Windows rejects an unknown
+/// name the same way Unix does.
+fn normalize_signal(name: &str) -> Option<&'static str> {
+    let n = name.trim().to_ascii_uppercase();
+    let n = n.strip_prefix("SIG").unwrap_or(&n);
+    SIGNAL_NAMES.iter().copied().find(|&s| s == n)
+}
+
 /// Map a signal name (with or without a leading "SIG") to a nix signal.
 #[cfg(unix)]
 fn parse_signal(name: &str) -> Option<nix::sys::signal::Signal> {
     use nix::sys::signal::Signal;
-    let n = name.trim().to_ascii_uppercase();
-    let n = n.strip_prefix("SIG").unwrap_or(&n);
-    Some(match n {
+    Some(match normalize_signal(name)? {
         "INT" => Signal::SIGINT,
         "TERM" => Signal::SIGTERM,
         "KILL" => Signal::SIGKILL,
@@ -596,30 +612,58 @@ impl TuiServer {
         Ok(reply(out))
     }
 
-    #[tool(
-        description = "Send an OS signal to a session's process (Unix only). Signal names: \
-        INT, TERM, KILL, HUP, QUIT, TSTP, CONT, STOP, WINCH, USR1, USR2 (leading 'SIG' \
-        optional). Useful for testing signal handlers, graceful shutdown (TERM), config \
-        reload (HUP), or suspend/resume (TSTP/CONT). The session is not removed."
+    // The MCP description is built from this method's doc lines, so that each
+    // platform gets only its own text: with no `description =` in `#[tool]`,
+    // rmcp 0.8 joins the doc lines below with "\n" (trimmed, empty ones
+    // dropped), and `cfg_attr` is resolved before the macro reads them.
+    // Keep developer notes in `//` comments here: every `///` line goes to MCP.
+    // Gotchas: rmcp-macros drops the doc lines collected so far at any other
+    // attribute, so keep `#[tool]` first and nothing between the doc lines;
+    // and `#[cfg_attr(…, tool(…))]` would compile but leave the tool out.
+    #[tool]
+    /// Send a signal to a session's program. The session is not removed.
+    #[cfg_attr(
+        unix,
+        doc = "Signal names: INT, TERM, KILL, HUP, QUIT, TSTP, CONT, STOP, WINCH, USR1, \
+        USR2 (leading 'SIG' optional). Useful for testing signal handlers, graceful \
+        shutdown (TERM), config reload (HUP), or suspend/resume (TSTP/CONT)."
+    )]
+    #[cfg_attr(
+        not(unix),
+        doc = "Windows has no signals: only INT works, and only in pty mode, where it \
+        types Ctrl+C (byte 0x03), even when the program uses the kitty keyboard \
+        protocol. A piped session cannot be interrupted; use session_stop."
     )]
     async fn signal(
         &self,
         Parameters(a): Parameters<SignalArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let unknown = || McpError::invalid_params(format!("unknown signal '{}'", a.signal), None);
         #[cfg(unix)]
         {
-            let sig = parse_signal(&a.signal).ok_or_else(|| {
-                McpError::invalid_params(format!("unknown signal '{}'", a.signal), None)
-            })?;
+            let sig = parse_signal(&a.signal).ok_or_else(unknown)?;
             let pid = self.sessions.signal(&a.name, sig).map_err(|e| err(&e))?;
             Ok(reply(format!("sent {sig:?} to pid {pid}")))
         }
         #[cfg(not(unix))]
         {
-            let _ = (&a.name, &a.signal);
-            Err(McpError::invalid_params(
-                "signals are only supported on Unix platforms".to_string(),
-                None,
+            // INT becomes a typed Ctrl+C (see `SessionManager::interrupt`),
+            // every other signal is refused.
+            let sig = normalize_signal(&a.signal).ok_or_else(unknown)?;
+            if sig != "INT" {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "signal {sig} is not supported on Windows: only INT works, in pty \
+                         mode, where it types Ctrl+C; use session_stop to end the program"
+                    ),
+                    None,
+                ));
+            }
+            self.sessions.interrupt(&a.name).map_err(|e| err(&e))?;
+            Ok(reply(
+                "typed Ctrl+C (byte 0x03) into the session: Windows has no signals. The \
+                 program may handle or ignore it, so it can still be running; check with \
+                 wait_for_exit or read_screen.",
             ))
         }
     }
@@ -1970,5 +2014,166 @@ mod tests {
         let a: WaitTextArgs =
             serde_json::from_str(r#"{"name":"s","text":"Ready","format":"none"}"#).unwrap();
         assert_eq!(a.format, WaitReturn::None);
+    }
+
+    /// `signal`'s tool and parameter descriptions carry only the running
+    /// platform's text (built from `cfg_attr` doc lines).
+    #[test]
+    fn signal_description_is_per_platform() {
+        let tool = TuiServer::router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "signal")
+            .expect("signal is registered");
+        let desc = tool.description.as_deref().unwrap_or_default().to_string();
+        let param = tool.input_schema["properties"]["signal"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            desc.starts_with("Send a signal to a session's program."),
+            "{desc}"
+        );
+        if cfg!(unix) {
+            assert!(
+                desc.contains("TSTP/CONT") && !desc.contains("Windows"),
+                "{desc}"
+            );
+            assert!(
+                param.contains("USR2") && !param.contains("Windows"),
+                "{param}"
+            );
+        } else {
+            assert!(
+                desc.contains("types Ctrl+C") && !desc.contains("TSTP"),
+                "{desc}"
+            );
+            assert!(param.contains("Only \"INT\" works on Windows"), "{param}");
+        }
+    }
+
+    #[test]
+    fn signal_names_are_normalized() {
+        assert_eq!(normalize_signal("int"), Some("INT"));
+        assert_eq!(normalize_signal(" SIGterm "), Some("TERM"));
+        assert_eq!(normalize_signal("usr2"), Some("USR2"));
+        assert_eq!(normalize_signal("FOO"), None);
+        assert_eq!(normalize_signal("SIG"), None);
+    }
+}
+
+/// `signal` on Windows: INT types a raw 0x03 into a pty session, everything
+/// else is refused with a message naming what works.
+#[cfg(all(test, windows))]
+mod windows_signal_tests {
+    use super::*;
+
+    fn text(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect()
+    }
+
+    async fn start(srv: &TuiServer, name: &str, command: &str, args: &[&str], mode: &str) {
+        srv.session_start(Parameters(StartArgs {
+            name: name.into(),
+            command: command.into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            cwd: None,
+            env: HashMap::new(),
+            cols: None,
+            rows: None,
+            mode: Some(mode.into()),
+            buffer_bytes: None,
+        }))
+        .await
+        .expect("session_start");
+    }
+
+    async fn signal(srv: &TuiServer, name: &str, sig: &str) -> Result<CallToolResult, McpError> {
+        srv.signal(Parameters(SignalArgs {
+            name: name.into(),
+            signal: sig.into(),
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn int_interrupts_a_pty_program() {
+        // The server does this at startup; a test run from Git Bash would
+        // otherwise pass an inherited "ignore Ctrl+C" flag on to ping.
+        assert!(windows_ctrl_c::pass_to_children());
+        let srv = TuiServer::new();
+        start(&srv, "ping", "ping", &["-n", "30", "127.0.0.1"], "pty").await;
+        // Wait until ping is running and printing, so the Ctrl+C reaches it.
+        let mut started = false;
+        for _ in 0..100 {
+            let screen = srv
+                .sessions
+                .with("ping", |s| match s {
+                    Session::Pty(p) => Ok(p.dump(ScreenFormat::Text).text),
+                    Session::Piped(_) => unreachable!("started as pty"),
+                })
+                .unwrap();
+            if screen.contains("127.0.0.1") {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if !started {
+            srv.sessions.remove("ping").ok();
+            panic!("ping printed nothing within 5 s");
+        }
+
+        let r = signal(&srv, "ping", "SIGINT").await.expect("signal INT");
+        assert!(
+            text(&r).starts_with("typed Ctrl+C (byte 0x03)"),
+            "{}",
+            text(&r)
+        );
+        let r = srv
+            .wait_for_exit(Parameters(WaitExitArgs {
+                name: "ping".into(),
+                timeout_ms: Some(5000),
+            }))
+            .await
+            .expect("wait_for_exit");
+        srv.sessions.remove("ping").ok();
+        assert!(text(&r).starts_with("exited: "), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn other_signals_piped_sessions_and_exited_programs_are_refused() {
+        let srv = TuiServer::new();
+        start(&srv, "pty", "ping", &["-n", "30", "127.0.0.1"], "pty").await;
+        start(&srv, "piped", "ping", &["-n", "30", "127.0.0.1"], "piped").await;
+        start(&srv, "done", "cmd.exe", &["/c", "exit 0"], "pty").await;
+        srv.wait_for_exit(Parameters(WaitExitArgs {
+            name: "done".into(),
+            timeout_ms: Some(5000),
+        }))
+        .await
+        .expect("wait_for_exit");
+
+        let term = signal(&srv, "pty", "TERM").await.unwrap_err().message;
+        let unknown = signal(&srv, "pty", "FOO").await.unwrap_err().message;
+        let piped = signal(&srv, "piped", "INT").await.unwrap_err().message;
+        let done = signal(&srv, "done", "INT").await.unwrap_err().message;
+        for name in ["pty", "piped", "done"] {
+            srv.sessions.remove(name).ok();
+        }
+
+        assert!(
+            term.contains("TERM is not supported on Windows") && term.contains("INT"),
+            "{term}"
+        );
+        assert_eq!(unknown, "unknown signal 'FOO'");
+        assert!(
+            piped.contains("piped session cannot be interrupted"),
+            "{piped}"
+        );
+        assert!(done.contains("already exited"), "{done}");
     }
 }
