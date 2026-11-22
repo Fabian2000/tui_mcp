@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -132,18 +133,32 @@ fn format_cmdline(opts: &SpawnOpts) -> String {
 
 /// The working directory the child will actually run in: the explicit `cwd` if
 /// given, otherwise the server's current directory (so it can be reproduced).
-fn resolve_cwd(opts: &SpawnOpts) -> String {
-    opts.cwd.clone().unwrap_or_else(|| {
-        std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
-    })
+/// It must be an existing folder, or the spawn is refused.
+///
+/// Both spawn paths pass the result on explicitly, never leaving it unset:
+/// portable-pty (0.9.0, `CommandBuilder`) starts a child with no `cwd`, or
+/// one that fails `is_dir()`, in the home folder (`USERPROFILE` on Windows,
+/// `HOME` or the passwd entry on Unix), not in the server's folder. Without
+/// the check a missing folder would silently become the home folder in pty
+/// mode, while a piped spawn fails with a vaguer OS error.
+///
+/// Kept as a path, not a string: `display()` replaces bytes that aren't valid
+/// UTF-8, so a server folder with such a name would not be found again.
+fn resolve_cwd(opts: &SpawnOpts) -> Result<PathBuf> {
+    let dir = match &opts.cwd {
+        Some(cwd) => PathBuf::from(cwd),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    if !dir.is_dir() {
+        bail!("cwd is not an existing folder: {}", dir.display());
+    }
+    Ok(dir)
 }
 
-fn build_command(opts: &SpawnOpts) -> CommandBuilder {
+fn build_command(opts: &SpawnOpts, cwd: &Path) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(&opts.command);
     cmd.args(&opts.args);
-    if let Some(cwd) = &opts.cwd {
-        cmd.cwd(cwd);
-    }
+    cmd.cwd(cwd);
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }
@@ -171,6 +186,7 @@ fn cursor_position_report(row: u16, col: u16) -> String {
 
 impl PtySession {
     pub fn spawn(opts: &SpawnOpts) -> Result<Self> {
+        let cwd = resolve_cwd(opts)?;
         let pty_system = portable_pty::native_pty_system();
         let size = PtySize {
             rows: opts.rows,
@@ -180,7 +196,7 @@ impl PtySession {
         };
         let pair = pty_system.openpty(size).context("failed to open pty")?;
 
-        let cmd = build_command(opts);
+        let cmd = build_command(opts, &cwd);
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -265,7 +281,7 @@ impl PtySession {
             cols: opts.cols,
             rows: opts.rows,
             cmdline: format_cmdline(opts),
-            cwd: resolve_cwd(opts),
+            cwd: cwd.display().to_string(),
             kitty,
             paste,
             hyperlinks,
@@ -417,14 +433,13 @@ pub enum ScreenFormat {
 impl PipedSession {
     pub fn spawn(opts: &SpawnOpts) -> Result<Self> {
         use std::process::{Command, Stdio};
+        let cwd = resolve_cwd(opts)?;
         let mut cmd = Command::new(&opts.command);
         cmd.args(&opts.args)
+            .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(cwd) = &opts.cwd {
-            cmd.current_dir(cwd);
-        }
         for (k, v) in &opts.env {
             cmd.env(k, v);
         }
@@ -450,7 +465,7 @@ impl PipedSession {
             _out_reader: out_reader,
             _err_reader: err_reader,
             cmdline: format_cmdline(opts),
-            cwd: resolve_cwd(opts),
+            cwd: cwd.display().to_string(),
         })
     }
 
@@ -732,6 +747,87 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         panic!("program did not exit within 5 s");
+    }
+
+    /// Options for a program that prints its working folder, in `cwd`.
+    fn print_cwd_opts(cwd: Option<String>) -> SpawnOpts {
+        #[cfg(windows)]
+        let (command, args) = ("cmd.exe", ["/c", "cd"]);
+        #[cfg(unix)]
+        let (command, args) = ("sh", ["-c", "pwd -P"]);
+        SpawnOpts {
+            command: command.to_string(),
+            args: args.map(str::to_string).to_vec(),
+            cwd,
+            env: HashMap::new(),
+            cols: 200,
+            rows: 24,
+            buffer_bytes: 4096,
+        }
+    }
+
+    /// Poll `text` for up to ~5 s until it contains `want`; returns the last text.
+    fn wait_contains(want: &str, mut text: impl FnMut() -> String) -> String {
+        let mut last = String::new();
+        for _ in 0..100 {
+            last = text();
+            if last.contains(want) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        last
+    }
+
+    /// Regression test: with no `cwd`, portable-pty started a pty child in the
+    /// home folder while `session_start` reported the server's folder.
+    #[test]
+    fn a_child_without_cwd_starts_in_the_servers_folder() {
+        let here = std::env::current_dir()
+            .expect("current dir")
+            .display()
+            .to_string();
+
+        let mut pty = PtySession::spawn(&print_cwd_opts(None)).expect("spawn under pty");
+        let screen = wait_contains(&here, || pty.dump(ScreenFormat::Text).text);
+        pty.kill();
+        assert!(
+            screen.contains(&here),
+            "pty child printed {screen:?}, expected {here:?}"
+        );
+        assert_eq!(pty.cwd(), here);
+
+        let piped = PipedSession::spawn(&print_cwd_opts(None)).expect("spawn piped");
+        let out = wait_contains(&here, || piped.read_stream(Stream::Stdout, false));
+        assert!(
+            out.contains(&here),
+            "piped child printed {out:?}, expected {here:?}"
+        );
+        assert_eq!(piped.cwd(), here);
+    }
+
+    /// A `cwd` that does not exist is refused in both modes, instead of the pty
+    /// child silently starting in the home folder.
+    #[test]
+    fn a_missing_cwd_is_refused() {
+        let missing = std::env::temp_dir()
+            .join(format!("tui-mcp-no-such-folder-{}", std::process::id()))
+            .display()
+            .to_string();
+        let opts = print_cwd_opts(Some(missing.clone()));
+
+        let Err(pty) = PtySession::spawn(&opts) else {
+            panic!("pty spawn in {missing} should fail");
+        };
+        let Err(piped) = PipedSession::spawn(&opts) else {
+            panic!("piped spawn in {missing} should fail");
+        };
+        for e in [pty, piped] {
+            assert_eq!(
+                e.to_string(),
+                format!("cwd is not an existing folder: {missing}")
+            );
+        }
     }
 
     #[test]
