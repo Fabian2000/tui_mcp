@@ -36,6 +36,26 @@ use wait::{POLL_INTERVAL_MS, WaitReturn, round_ms, sample_screen, wait_reply};
 
 // ---- Tool input schemas ----------------------------------------------------
 
+// Defaults of optional parameters. Each is used twice: the handler falls back to
+// it, and `#[schemars(extend("default" = …))]` states it in the tool's input
+// schema. Without the `extend`, `#[serde(default)]` on an `Option` field makes
+// schemars publish `"default": null`, which contradicts the "(default N)" in the
+// description. Optional fields with no fixed default (`cwd`, `page`) drop
+// `#[serde(default)]` instead, so the schema has no `default` key at all; serde
+// still treats a missing `Option` field as `None`.
+const DEFAULT_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+const DEFAULT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_COUNT: u32 = 1;
+const DEFAULT_DELAY_MS: u64 = 0;
+const DEFAULT_MOUSE_ACTION: &str = "left";
+const DEFAULT_STABLE_MS: u64 = 300;
+const DEFAULT_PAGE_SIZE: usize = 100;
+const DEFAULT_MAX_RESULTS: usize = 50;
+const DEFAULT_CONTEXT_LINES: usize = 0;
+const MAX_SLEEP_MS: u64 = 60_000;
+
 #[derive(Deserialize, JsonSchema)]
 struct StartArgs {
     /// Unique name to refer to this session in later calls.
@@ -46,24 +66,27 @@ struct StartArgs {
     #[serde(default)]
     args: Vec<String>,
     /// Working directory.
-    #[serde(default)]
     cwd: Option<String>,
     /// Extra environment variables.
     #[serde(default)]
     env: HashMap<String, String>,
     /// Terminal columns (pty mode). Default 80.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_COLS))]
     cols: Option<u16>,
     /// Terminal rows (pty mode). Default 24.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_ROWS))]
     rows: Option<u16>,
     /// "pty" (default, real terminal for TUIs) or "piped" (separate
     /// stdout/stderr, no TTY).
     #[serde(default)]
+    #[schemars(extend("default" = "pty"))]
     mode: Option<String>,
     /// Per-stream output buffer cap in bytes for piped mode (ring buffer,
     /// oldest bytes drop when exceeded). Default 2 MiB.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_BUFFER_BYTES))]
     buffer_bytes: Option<usize>,
 }
 
@@ -92,6 +115,7 @@ struct SendKeyArgs {
     modifiers: Vec<String>,
     /// Repeat the key this many times (default 1).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_COUNT))]
     count: Option<u32>,
 }
 
@@ -104,6 +128,7 @@ struct SendKeysArgs {
     keys: Vec<String>,
     /// Optional delay between key presses in milliseconds. Omit or 0 for none.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_DELAY_MS))]
     delay_ms: Option<u64>,
 }
 
@@ -115,6 +140,7 @@ struct SendTextArgs {
     /// Optional delay between characters in milliseconds, to pace input for
     /// programs that drop fast bursts. Omit or 0 to send it all at once.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_DELAY_MS))]
     delay_ms: Option<u64>,
 }
 
@@ -152,16 +178,19 @@ struct MouseArgs {
     /// One of: `left`, `right`, `middle`, `scroll_up`, `scroll_down`, `down`,
     /// `up`, `move`/`drag`, `hover`.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_MOUSE_ACTION))]
     action: Option<String>,
     #[serde(default)]
     modifiers: Vec<String>,
     /// Repeat the whole action this many times in one call (count=2
     /// double-click, 3 triple). Default 1.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_COUNT))]
     count: Option<u32>,
     /// Gap in ms between repeats (only when count > 1). Omit/0 for a zero-gap
     /// burst (double-click); non-zero spaces them into distinct events.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_DELAY_MS))]
     delay_ms: Option<u64>,
 }
 
@@ -170,6 +199,7 @@ struct ScreenArgs {
     name: String,
     /// "text" (plain, default) or "ansi" (with color/attribute escapes).
     #[serde(default)]
+    #[schemars(extend("default" = "text"))]
     format: Option<String>,
 }
 
@@ -185,9 +215,11 @@ struct ReadStreamArgs {
     name: String,
     /// "stdout" (default) or "stderr".
     #[serde(default)]
+    #[schemars(extend("default" = "stdout"))]
     stream: Option<String>,
     /// If true, clear the buffer after reading (default false).
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     clear: Option<bool>,
 }
 
@@ -198,12 +230,15 @@ struct WaitTextArgs {
     text: String,
     /// Treat `text` as a regular expression instead of a literal substring.
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     regex: Option<bool>,
     /// Wait for the text to be ABSENT (disappear) instead of present.
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     absent: Option<bool>,
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
     /// Screen to return once resolved: "none" (outcome only), "text" (plain,
     /// default), or "ansi" (with color/attribute escapes).
@@ -216,6 +251,7 @@ struct WaitChangeArgs {
     name: String,
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
     /// Screen to return once resolved: "none" (outcome only), "text" (plain,
     /// default), or "ansi" (with color/attribute escapes).
@@ -228,6 +264,7 @@ struct WaitExitArgs {
     name: String,
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
 }
 
@@ -238,12 +275,15 @@ struct WaitOutputArgs {
     text: String,
     /// Which piped stream to watch: "stdout" (default) or "stderr".
     #[serde(default)]
+    #[schemars(extend("default" = "stdout"))]
     stream: Option<String>,
     /// Treat `text` as a regular expression.
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     regex: Option<bool>,
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
 }
 
@@ -252,9 +292,11 @@ struct WaitStableArgs {
     name: String,
     /// Screen must be unchanged for this many ms (default 300).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_STABLE_MS))]
     stable_ms: Option<u64>,
     /// Give up after this many ms (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
     /// Screen to return once resolved: "none" (outcome only), "text" (plain,
     /// default), or "ansi" (with color/attribute escapes).
@@ -267,9 +309,9 @@ struct ScrollbackArgs {
     name: String,
     /// Lines per page (default 100).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_PAGE_SIZE))]
     page_size: Option<usize>,
     /// 0-based page index. Omit to get the most recent page (the tail).
-    #[serde(default)]
     page: Option<usize>,
 }
 
@@ -280,12 +322,15 @@ struct SearchArgs {
     pattern: String,
     /// Case-insensitive matching (default false).
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     ignore_case: Option<bool>,
     /// Max matching lines to return (default 50).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_MAX_RESULTS))]
     max_results: Option<usize>,
     /// Lines of context to include before and after each match (default 0).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_CONTEXT_LINES))]
     context: Option<usize>,
 }
 
@@ -295,6 +340,7 @@ struct SleepArgs {
     ms: u64,
     /// Upper bound on the sleep, in milliseconds (default and hard cap: 60000).
     #[serde(default)]
+    #[schemars(extend("default" = MAX_SLEEP_MS))]
     max_ms: Option<u64>,
 }
 
@@ -488,9 +534,9 @@ impl TuiServer {
             args: a.args,
             cwd: a.cwd,
             env: a.env,
-            cols: a.cols.unwrap_or(80),
-            rows: a.rows.unwrap_or(24),
-            buffer_bytes: a.buffer_bytes.unwrap_or(2 * 1024 * 1024),
+            cols: a.cols.unwrap_or(DEFAULT_COLS),
+            rows: a.rows.unwrap_or(DEFAULT_ROWS),
+            buffer_bytes: a.buffer_bytes.unwrap_or(DEFAULT_BUFFER_BYTES),
         };
         let (cmdline, cwd) = self
             .sessions
@@ -593,7 +639,7 @@ impl TuiServer {
         // encoding as the fallback byte sequence.
         let legacy = key_to_bytes(&a.key, mods)
             .ok_or_else(|| McpError::invalid_params(format!("unknown key '{}'", a.key), None))?;
-        let count = a.count.unwrap_or(1).max(1);
+        let count = a.count.unwrap_or(DEFAULT_COUNT).max(1);
         let mut kitty_used = false;
         self.sessions
             .with(&a.name, |s| {
@@ -639,7 +685,7 @@ impl TuiServer {
                 ));
             }
         }
-        let delay = a.delay_ms.unwrap_or(0);
+        let delay = a.delay_ms.unwrap_or(DEFAULT_DELAY_MS);
         if delay > 0 {
             for (key, mods) in &parsed {
                 self.sessions
@@ -759,13 +805,13 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<MouseArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let action_name = a.action.as_deref().unwrap_or("left");
+        let action_name = a.action.as_deref().unwrap_or(DEFAULT_MOUSE_ACTION);
         let action = parse_action(action_name).ok_or_else(|| {
             McpError::invalid_params(format!("unknown mouse action '{action_name}'"), None)
         })?;
         let mods = Mods::from_list(&a.modifiers);
-        let count = a.count.unwrap_or(1).max(1);
-        let delay = a.delay_ms.unwrap_or(0);
+        let count = a.count.unwrap_or(DEFAULT_COUNT).max(1);
+        let delay = a.delay_ms.unwrap_or(DEFAULT_DELAY_MS);
         let seqs = action_to_bytes(action, a.x, a.y, mods);
         // Mirrors send_keys: with no delay, write every cycle under a single lock
         // hold so the burst can't be interleaved by another tool call (a
@@ -901,7 +947,7 @@ impl TuiServer {
             .map_err(|e| err(&e))?;
 
         let total = lines.len();
-        let page_size = a.page_size.unwrap_or(100).max(1);
+        let page_size = a.page_size.unwrap_or(DEFAULT_PAGE_SIZE).max(1);
         let total_pages = total.div_ceil(page_size).max(1);
         let page = a
             .page
@@ -936,8 +982,8 @@ impl TuiServer {
             .case_insensitive(a.ignore_case.unwrap_or(false))
             .build()
             .map_err(|e| McpError::invalid_params(format!("bad regex: {e}"), None))?;
-        let max = a.max_results.unwrap_or(50).max(1);
-        let ctx = a.context.unwrap_or(0);
+        let max = a.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1);
+        let ctx = a.context.unwrap_or(DEFAULT_CONTEXT_LINES);
 
         let lines = self
             .sessions
@@ -1038,7 +1084,7 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<SleepArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let cap = a.max_ms.unwrap_or(60_000).min(60_000);
+        let cap = a.max_ms.unwrap_or(MAX_SLEEP_MS).min(MAX_SLEEP_MS);
         let ms = a.ms.min(cap);
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         Ok(reply(format!("slept {ms}ms")))
@@ -1054,7 +1100,7 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<WaitTextArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let absent = a.absent.unwrap_or(false);
         let format = a.format;
         let re = if a.regex.unwrap_or(false) {
@@ -1109,7 +1155,7 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<WaitChangeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let format = a.format;
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_millis(timeout);
@@ -1160,7 +1206,7 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<WaitExitArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
         loop {
             let status = self
@@ -1190,7 +1236,7 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<WaitOutputArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let which = match a.stream.as_deref() {
             Some("stderr") => Stream::Stderr,
             _ => Stream::Stdout,
@@ -1238,8 +1284,8 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<WaitStableArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let stable_ms = a.stable_ms.unwrap_or(300);
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let stable_ms = a.stable_ms.unwrap_or(DEFAULT_STABLE_MS);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let format = a.format;
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_millis(timeout);
@@ -1804,6 +1850,42 @@ mod tests {
                 "missing default in {schema}"
             );
         }
+    }
+
+    #[test]
+    fn no_tool_parameter_publishes_a_null_default() {
+        // `#[serde(default)]` on an `Option` field makes schemars publish
+        // `"default": null`. Such a field must state its real default with
+        // `#[schemars(extend("default" = …))]`, or drop `#[serde(default)]` when
+        // it has no fixed default. `router()` includes the `dev-tools` tools when
+        // that feature is on.
+        for tool in TuiServer::router().list_all() {
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object());
+            for (param, schema) in props.into_iter().flatten() {
+                assert_ne!(
+                    schema.get("default"),
+                    Some(&serde_json::Value::Null),
+                    "{}.{param} publishes \"default\": null",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_default_comes_from_the_handler_constant() {
+        let tool = TuiServer::router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "wait_for_text")
+            .unwrap();
+        assert_eq!(
+            tool.input_schema["properties"]["timeout_ms"]["default"],
+            serde_json::json!(DEFAULT_TIMEOUT_MS)
+        );
     }
 
     #[test]
