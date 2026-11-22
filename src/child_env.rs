@@ -70,14 +70,18 @@ impl ChildEnv for std::process::Command {
 }
 
 /// Build the child's environment: the inherited one minus
-/// [`STRIPPED_CLIENT_ENV`], then the caller's `env`. The caller's values are
-/// applied last, so they win, including for a stripped name.
-pub fn apply_env(cmd: &mut impl ChildEnv, env: &HashMap<String, String>) {
+/// [`STRIPPED_CLIENT_ENV`], then the caller's `env`, where `Some` sets a
+/// variable and `None` removes it. The caller's entries are applied last, so
+/// they win, including for a stripped name.
+pub fn apply_env(cmd: &mut impl ChildEnv, env: &HashMap<String, Option<String>>) {
     for name in STRIPPED_CLIENT_ENV {
         cmd.remove_var(name);
     }
     for (k, v) in env {
-        cmd.set_var(k, v);
+        match v {
+            Some(v) => cmd.set_var(k, v),
+            None => cmd.remove_var(k),
+        }
     }
 }
 
@@ -85,10 +89,10 @@ pub fn apply_env(cmd: &mut impl ChildEnv, env: &HashMap<String, String>) {
 mod tests {
     use super::*;
 
-    fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    fn env_of(pairs: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| ((*k).to_string(), v.map(str::to_string)))
             .collect()
     }
 
@@ -133,7 +137,10 @@ mod tests {
         cmd.env("CLAUDE_CODE_ENTRYPOINT", "claude-desktop");
         apply_env(
             &mut cmd,
-            &env_of(&[("CLAUDE_CODE_ENTRYPOINT", "cli"), ("FOO", "bar")]),
+            &env_of(&[
+                ("CLAUDE_CODE_ENTRYPOINT", Some("cli")),
+                ("FOO", Some("bar")),
+            ]),
         );
         assert_eq!(cmd.get_env("CLAUDE_CODE_ENTRYPOINT"), Some("cli".as_ref()));
         assert_eq!(cmd.get_env("FOO"), Some("bar".as_ref()));
@@ -154,11 +161,42 @@ mod tests {
     #[test]
     fn piped_env_explicit_value_wins_over_stripping() {
         let mut cmd = std::process::Command::new("prog");
-        apply_env(&mut cmd, &env_of(&[("CLAUDE_CODE_SESSION_ID", "chosen")]));
+        apply_env(
+            &mut cmd,
+            &env_of(&[("CLAUDE_CODE_SESSION_ID", Some("chosen"))]),
+        );
         assert_eq!(
             std_env_value(&cmd, "CLAUDE_CODE_SESSION_ID"),
             Some(Some("chosen".to_string()))
         );
+    }
+
+    #[test]
+    fn pty_env_null_removes_a_variable() {
+        let mut cmd = CommandBuilder::new("prog");
+        // Stand-in for an inherited variable the caller wants gone.
+        cmd.env("CLAUDECODE", "1");
+        cmd.env("KEEP_ME", "yes");
+        apply_env(
+            &mut cmd,
+            &env_of(&[("CLAUDECODE", None), ("EMPTY", Some(""))]),
+        );
+        assert_eq!(cmd.get_env("CLAUDECODE"), None);
+        assert_eq!(cmd.get_env("KEEP_ME"), Some("yes".as_ref()));
+        // An empty string still sets the variable, to empty.
+        assert_eq!(cmd.get_env("EMPTY"), Some("".as_ref()));
+    }
+
+    #[test]
+    fn piped_env_null_removes_a_variable() {
+        let mut cmd = std::process::Command::new("prog");
+        cmd.env("CLAUDECODE", "1");
+        apply_env(
+            &mut cmd,
+            &env_of(&[("CLAUDECODE", None), ("EMPTY", Some(""))]),
+        );
+        assert_eq!(std_env_value(&cmd, "CLAUDECODE"), Some(None));
+        assert_eq!(std_env_value(&cmd, "EMPTY"), Some(Some(String::new())));
     }
 
     /// Windows environment names are case-insensitive, so a differently cased

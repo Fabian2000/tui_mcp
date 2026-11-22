@@ -24,7 +24,9 @@ pub struct SpawnOpts {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
-    pub env: HashMap<String, String>,
+    /// Variables to set (`Some`) or remove (`None`) on top of the inherited
+    /// environment.
+    pub env: HashMap<String, Option<String>>,
     pub cols: u16,
     pub rows: u16,
     /// Per-stream output cap for piped sessions, in bytes (ring buffer).
@@ -668,6 +670,27 @@ mod tests {
         // DSR reply is `CSI row;col R`, 1-based, row before col.
         assert_eq!(cursor_position_report(0, 0), "\x1b[1;1R");
         assert_eq!(cursor_position_report(24, 79), "\x1b[25;80R");
+    }
+
+    /// `build_command` must route `env` through `apply_env`: a null removes
+    /// even an inherited variable (`PATH` is always inherited), a value sets.
+    #[test]
+    fn build_command_applies_env() {
+        let opts = SpawnOpts {
+            command: "prog".to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: HashMap::from([
+                ("PATH".to_string(), None),
+                ("FOO".to_string(), Some("bar".to_string())),
+            ]),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 0,
+        };
+        let cmd = build_command(&opts);
+        assert_eq!(cmd.get_env("PATH"), None);
+        assert_eq!(cmd.get_env("FOO"), Some("bar".as_ref()));
     }
 }
 

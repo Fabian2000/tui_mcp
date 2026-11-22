@@ -263,7 +263,8 @@ variables you set yourself with the same prefix.
 Only Claude Code's variables are removed for now. The full list is
 `STRIPPED_CLIENT_ENV` in [`src/child_env.rs`](src/child_env.rs). To pass one of
 them anyway, set it in the `env` argument of `session_start`: values given there
-always win.
+always win. A `null` value in `env` removes that variable instead, for any name,
+inherited or not.
 
 ## Security model
 
