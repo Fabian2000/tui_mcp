@@ -17,6 +17,8 @@ mod render;
 mod schema;
 mod session;
 mod wait;
+#[cfg(windows)]
+mod windows_ctrl_c;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -1489,6 +1491,11 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    #[cfg(windows)]
+    if !windows_ctrl_c::pass_to_children() {
+        tracing::warn!("could not clear an inherited \"ignore Ctrl+C\" flag");
+    }
 
     let service = TuiServer::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
