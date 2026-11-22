@@ -250,6 +250,22 @@ If a program produces more than that between reads, the oldest bytes are dropped
 mistaken for the program's complete output. For chatty long-running programs,
 read often and pass `clear: true`.
 
+## Environment of started programs
+
+A started program inherits the server's environment, with one exception: the
+variables an MCP client sets about its own session and account are removed, such
+as its session ids, its messaging token and socket, and the signed-in user's
+email and account ids. They describe the agent's session, not the program's, and
+some are private. A nested agent started with them would also act as part of the
+host session. Everything else is passed on as the server has it, including
+variables you set yourself with the same prefix.
+
+Only Claude Code's variables are removed for now. The full list is
+`STRIPPED_CLIENT_ENV` in [`src/child_env.rs`](src/child_env.rs). To pass one of
+them anyway, set it in the `env` argument of `session_start`: values given there
+always win. A `null` value in `env` removes that variable instead, for any name,
+inherited or not.
+
 ## Security model
 
 This server runs whatever commands the connected client asks it to, in the
