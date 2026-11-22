@@ -830,6 +830,34 @@ mod tests {
         }
     }
 
+    /// A piped program waiting for a line gets it from the Enter key: `\n`,
+    /// not the `\r` a terminal sends (which no line reader ends a line on).
+    #[test]
+    fn a_piped_program_reads_a_line_ended_by_enter() {
+        #[cfg(windows)]
+        let (command, args) = ("cmd.exe", vec!["/v:on", "/c", "set /p L=& echo got:!L!."]);
+        #[cfg(unix)]
+        let (command, args) = ("sh", vec!["-c", "read L; echo got:$L."]);
+        let opts = SpawnOpts {
+            command: command.to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 4096,
+        };
+        let mut piped = PipedSession::spawn(&opts).expect("spawn piped");
+        let enter = crate::keys::piped_key_to_bytes("enter", crate::keys::Mods::default())
+            .expect("enter is a key");
+        piped.write(b"abc").expect("write text");
+        piped.write(&enter).expect("write enter");
+
+        let out = wait_contains("got:abc.", || piped.read_stream(Stream::Stdout, false));
+        piped.kill();
+        assert!(out.contains("got:abc."), "piped program printed {out:?}");
+    }
+
     #[test]
     fn pty_and_piped_word_an_exit_code_the_same() {
         let mut pty = PtySession::spawn(&exit_3_opts()).expect("spawn under pty");

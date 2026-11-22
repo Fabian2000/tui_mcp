@@ -386,13 +386,16 @@ fn parse_combo(combo: &str) -> (String, Mods) {
     (key, Mods::from_list(&mods))
 }
 
-/// Resolve a key + modifiers to bytes for a session, using kitty encoding when
-/// the (pty) session has the protocol enabled, else the legacy encoding.
+/// Resolve a key + modifiers to bytes for a session: kitty encoding when the
+/// pty session has the protocol enabled, else the legacy encoding; a piped
+/// session gets `keys::piped_key_to_bytes`.
 fn key_bytes_for(session: &session::Session, key: &str, mods: Mods) -> Option<Vec<u8>> {
-    let legacy = key_to_bytes(key, mods)?;
     Some(match session {
-        Session::Pty(p) => keys::kitty_encode(key, mods, p.kitty_flags()).unwrap_or(legacy),
-        Session::Piped(_) => legacy,
+        Session::Pty(p) => {
+            let legacy = key_to_bytes(key, mods)?;
+            keys::kitty_encode(key, mods, p.kitty_flags()).unwrap_or(legacy)
+        }
+        Session::Piped(_) => keys::piped_key_to_bytes(key, mods)?,
     })
 }
 
@@ -670,7 +673,11 @@ impl TuiServer {
                         }
                         None => legacy.clone(),
                     },
-                    Session::Piped(_) => legacy.clone(),
+                    // The key is known (checked above), and piped_key_to_bytes
+                    // knows the same keys, so the fallback never runs.
+                    Session::Piped(_) => {
+                        keys::piped_key_to_bytes(&a.key, mods).unwrap_or_else(|| legacy.clone())
+                    }
                 };
                 for _ in 0..count {
                     write_session(s, &bytes)?;
