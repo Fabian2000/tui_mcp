@@ -228,7 +228,10 @@ struct WaitTextArgs {
     name: String,
     /// Text to wait for on screen (substring, or regex if `regex` is true).
     text: String,
-    /// Treat `text` as a regular expression instead of a literal substring.
+    /// Treat `text` as a regular expression instead of a literal substring. The
+    /// pattern runs in multi-line mode: `^` and `$` match at the start and end of
+    /// each screen line, not only of the whole screen (use `\A` and `\z` for
+    /// those).
     #[serde(default)]
     #[schemars(extend("default" = false))]
     regex: Option<bool>,
@@ -277,7 +280,9 @@ struct WaitOutputArgs {
     #[serde(default)]
     #[schemars(extend("default" = "stdout"))]
     stream: Option<String>,
-    /// Treat `text` as a regular expression.
+    /// Treat `text` as a regular expression. The pattern runs in multi-line
+    /// mode: `^` and `$` match at the start and end of each output line, not
+    /// only of the whole buffer (use `\A` and `\z` for those).
     #[serde(default)]
     #[schemars(extend("default" = false))]
     regex: Option<bool>,
@@ -489,6 +494,20 @@ async fn write_png(path: &std::path::Path, png: &[u8]) -> std::io::Result<std::p
         std::io::ErrorKind::AlreadyExists,
         "too many colliding screenshot files",
     ))
+}
+
+/// Compile a `wait_for_text` or `wait_for_output` pattern. The screen, and a
+/// piped stream's buffer, is one string with a line break per line, so in the
+/// default single-line mode `$` matched only at the very end and a pattern like
+/// `done 3:16 PM$` could never match a line in the middle. Multi-line mode makes
+/// `^` and `$` work per line; `\A` and `\z` still anchor to the whole text.
+/// CRLF mode lets `$` match before a `\r\n` too, as Windows programs write it to
+/// a pipe; without it `foo$` would miss `foo\r\n`.
+fn line_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .multi_line(true)
+        .crlf(true)
+        .build()
 }
 
 fn screen_format(s: Option<&str>) -> ScreenFormat {
@@ -1105,7 +1124,7 @@ impl TuiServer {
         let format = a.format;
         let re = if a.regex.unwrap_or(false) {
             Some(
-                regex::Regex::new(&a.text)
+                line_regex(&a.text)
                     .map_err(|e| McpError::invalid_params(format!("bad regex: {e}"), None))?,
             )
         } else {
@@ -1243,7 +1262,7 @@ impl TuiServer {
         };
         let re = if a.regex.unwrap_or(false) {
             Some(
-                regex::Regex::new(&a.text)
+                line_regex(&a.text)
                     .map_err(|e| McpError::invalid_params(format!("bad regex: {e}"), None))?,
             )
         } else {
@@ -1547,6 +1566,30 @@ mod tests {
         // A lone "+" has no modifiers and is treated as the key itself.
         let (key, _mods) = parse_combo("+");
         assert_eq!(key, "+");
+    }
+
+    #[test]
+    fn line_regex_anchors_per_line() {
+        let screen = "✻ Churned for 10s · done 3:16 PM\n> \nfooter";
+        // `$` and `^` match at a line in the middle of the screen.
+        assert!(line_regex("done 3:16 PM$").unwrap().is_match(screen));
+        assert!(line_regex("^> $").unwrap().is_match(screen));
+        // `\A` and `\z` still anchor to the whole screen.
+        assert!(!line_regex(r"done 3:16 PM\z").unwrap().is_match(screen));
+        assert!(line_regex(r"footer\z").unwrap().is_match(screen));
+        assert!(!line_regex(r"\A> ").unwrap().is_match(screen));
+    }
+
+    #[test]
+    fn line_regex_anchors_before_crlf() {
+        let output = "building\r\ndone in 3s\r\nexit\r\n";
+        assert!(line_regex("^done in 3s$").unwrap().is_match(output));
+        assert!(line_regex(r"exit\r?\n\z").unwrap().is_match(output));
+    }
+
+    #[test]
+    fn line_regex_reports_bad_patterns() {
+        assert!(line_regex("(unclosed").is_err());
     }
 
     #[test]
