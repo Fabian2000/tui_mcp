@@ -105,7 +105,8 @@ struct StartArgs {
     args: Vec<String>,
     // The default is the folder this server process was started in. The client
     // sets that folder, and it is not always the agent's own (seen: for a
-    // Claude Code session in a git worktree it was the main checkout). The text
+    // session the Claude Code Desktop app created in a new git worktree, it
+    // was the main checkout; `claude -w` gets the worktree). The text
     // avoids "the server's": an agent only sees a list of tools.
     /// Working directory. Set it: the default may differ from your current
     /// directory.
