@@ -73,6 +73,10 @@ const MAX_SLEEP_MS: u64 = 60_000;
 /// Enter correctly even in the same write as the text.
 const SUBMIT_WAIT_MS: u64 = 20;
 
+// The `///` lines on these argument structs, and the tool descriptions below,
+// make up the schema every client loads into each session: keep them short,
+// and add a caveat only for a trap agents actually hit.
+
 #[derive(Deserialize, JsonSchema)]
 struct StartArgs {
     /// Unique name to refer to this session in later calls.
@@ -82,12 +86,17 @@ struct StartArgs {
     /// Arguments passed to the program.
     #[serde(default)]
     args: Vec<String>,
-    /// Working directory.
+    // The default is the folder this server process was started in. The client
+    // sets that folder, and it is not always the agent's own (seen: for a
+    // Claude Code session in a git worktree it was the main checkout). The text
+    // avoids "the server's": an agent only sees a list of tools.
+    /// Working directory. Set it: the default may differ from your current
+    /// directory.
     cwd: Option<String>,
     /// Extra environment variables.
     #[serde(default)]
     env: HashMap<String, String>,
-    /// Terminal columns (pty mode). Default 80.
+    /// Terminal columns (pty mode). Default 80; wider avoids wrapped lines.
     #[serde(default)]
     #[schemars(extend("default" = DEFAULT_COLS))]
     cols: Option<u16>,
@@ -152,7 +161,8 @@ struct SendKeysArgs {
 #[derive(Deserialize, JsonSchema)]
 struct SendTextArgs {
     name: String,
-    /// Literal text typed verbatim into the program.
+    /// Literal text typed verbatim into the program. A newline in it is a line
+    /// feed, which not every program takes as Enter; set `submit` to submit.
     text: String,
     /// Optional delay between characters in milliseconds, to pace input for
     /// programs that drop fast bursts. Omit or 0 to send it all at once.
@@ -171,11 +181,7 @@ struct SendTextArgs {
 #[derive(Deserialize, JsonSchema)]
 struct SignalArgs {
     name: String,
-    #[cfg_attr(
-        unix,
-        doc = "Signal name, e.g. \"INT\", \"TERM\", \"HUP\", \"KILL\", \"TSTP\", \"CONT\", \
-        \"WINCH\", \"USR1\", \"USR2\" (a leading \"SIG\" is also accepted)."
-    )]
+    #[cfg_attr(unix, doc = "Signal name, e.g. \"INT\".")]
     #[cfg_attr(not(unix), doc = "Signal name. Only \"INT\" works on Windows.")]
     signal: String,
 }
@@ -192,7 +198,8 @@ struct PasteArgs {
 #[derive(Deserialize, JsonSchema)]
 struct SendBytesArgs {
     name: String,
-    /// Bytes with C-style escapes: \n \r \t \0 \e (ESC) \xHH \\.
+    /// Bytes with C-style escapes: \n \r \t \0 \e (ESC) \xHH \\. Double every
+    /// literal backslash, or it starts an escape.
     data: String,
 }
 
@@ -208,6 +215,7 @@ struct MouseArgs {
     #[serde(default)]
     #[schemars(extend("default" = DEFAULT_MOUSE_ACTION))]
     action: Option<String>,
+    /// Any of "ctrl", "alt", "shift".
     #[serde(default)]
     modifiers: Vec<String>,
     /// Repeat the whole action this many times in one call (count=2
@@ -255,11 +263,17 @@ struct ReadStreamArgs {
 struct WaitTextArgs {
     name: String,
     /// Text to wait for on screen (substring, or regex if `regex` is true).
+    /// Don't end it with a space: trailing spaces may be trimmed.
     text: String,
+    // A screen line is not always one row: the emulator returns a row whose
+    // text wrapped past the last column and the next row as one line. Any long
+    // line does it; ConPTY on Windows pads its rows to full width, so there it
+    // is common.
     /// Treat `text` as a regular expression instead of a literal substring. The
     /// pattern runs in multi-line mode: `^` and `$` match at the start and end of
     /// each screen line, not only of the whole screen (use `\A` and `\z` for
-    /// those).
+    /// those). A row whose text wraps into the next one has no line break after
+    /// it, so `^`/`$` don't match at that row edge.
     #[serde(default)]
     #[schemars(extend("default" = false))]
     regex: Option<bool>,
@@ -271,8 +285,9 @@ struct WaitTextArgs {
     #[serde(default)]
     #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
-    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
-    /// default), or "ansi" (with color/attribute escapes).
+    /// Screen to return once resolved: "none" (outcome only, no screen
+    /// content), "text" (plain, default), or "ansi" (with color/attribute
+    /// escapes).
     #[serde(default)]
     format: WaitReturn,
 }
@@ -284,8 +299,9 @@ struct WaitChangeArgs {
     #[serde(default)]
     #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
-    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
-    /// default), or "ansi" (with color/attribute escapes).
+    /// Screen to return once resolved: "none" (outcome only, no screen
+    /// content), "text" (plain, default), or "ansi" (with color/attribute
+    /// escapes).
     #[serde(default)]
     format: WaitReturn,
 }
@@ -331,8 +347,9 @@ struct WaitStableArgs {
     #[serde(default)]
     #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
-    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
-    /// default), or "ansi" (with color/attribute escapes).
+    /// Screen to return once resolved: "none" (outcome only, no screen
+    /// content), "text" (plain, default), or "ansi" (with color/attribute
+    /// escapes).
     #[serde(default)]
     format: WaitReturn,
 }
@@ -642,13 +659,19 @@ impl TuiServer {
     // Gotchas: rmcp-macros drops the doc lines collected so far at any other
     // attribute, so keep `#[tool]` first and nothing between the doc lines;
     // and `#[cfg_attr(…, tool(…))]` would compile but leave the tool out.
+    // On Unix, TSTP does nothing because the kernel discards it, not this code:
+    // the pty child leads its own session and its parent is outside it, so its
+    // process group is orphaned. STOP is not affected. "Only the session's own
+    // process" because the signal goes to one pid, not to the terminal's
+    // foreground process group.
     #[tool]
     /// Send a signal to a session's program. The session is not removed.
     #[cfg_attr(
         unix,
         doc = "Signal names: INT, TERM, KILL, HUP, QUIT, TSTP, CONT, STOP, WINCH, USR1, \
-        USR2 (leading 'SIG' optional). Useful for testing signal handlers, graceful \
-        shutdown (TERM), config reload (HUP), or suspend/resume (TSTP/CONT)."
+        USR2 (leading 'SIG' optional). Only the session's own process gets it; for a \
+        command inside a shell send Ctrl+C with send_key. To suspend use STOP; TSTP \
+        does nothing in pty mode."
     )]
     #[cfg_attr(
         not(unix),
@@ -965,7 +988,7 @@ impl TuiServer {
     #[tool(
         description = "Read the current terminal screen as text (pty sessions only). \
         format='text' (default) or 'ansi' for colors/attributes. Includes a status \
-        line with size and cursor position."
+        line with size and 0-based cursor position."
     )]
     async fn read_screen(
         &self,
@@ -986,8 +1009,8 @@ impl TuiServer {
 
     #[tool(
         description = "Take a PNG screenshot of the pty screen, for checking colors / \
-        layout. PREFER read_screen (plain text) when you only need the content, since it is \
-        much cheaper in tokens. Use this only when color or visual layout matters."
+        layout; returns the image only, no text. PREFER read_screen (plain text) when you \
+        only need the content, since it is much cheaper in tokens."
     )]
     async fn screenshot(
         &self,
@@ -1137,7 +1160,13 @@ impl TuiServer {
         Ok(reply(format!("{hits} match(es):\n{out}")))
     }
 
-    #[tool(description = "Resize the terminal of a pty session (cols x rows).")]
+    // Built from doc lines so each platform gets its own text, as on `signal`
+    // (see the comment there for the rmcp gotchas). The Unix line exists
+    // because the vt100 emulator does not reflow on resize; ConPTY on Windows
+    // does.
+    #[tool]
+    /// Resize the terminal of a pty session (cols x rows).
+    #[cfg_attr(unix, doc = "Existing lines are not reflowed; longer ones are cut.")]
     async fn resize(
         &self,
         Parameters(a): Parameters<ResizeArgs>,
@@ -1207,7 +1236,7 @@ impl TuiServer {
         description = "Block until text appears on the screen (pty sessions), then return \
         the screen. Set regex=true to match a pattern, or absent=true to instead wait for \
         the text to DISAPPEAR (e.g. a 'Loading...' spinner). Use this to synchronize with \
-        the program instead of guessing delays."
+        the program instead of guessing delays. Text already on screen matches at once."
     )]
     async fn wait_for_text(
         &self,
@@ -1391,7 +1420,8 @@ impl TuiServer {
 
     #[tool(
         description = "Block until the screen stops changing for `stable_ms`, or until \
-        timeout (pty sessions). Useful to wait for a program to finish redrawing."
+        timeout (pty sessions). Useful to wait for a program to finish redrawing. Never \
+        settles while a spinner or clock animates: use wait_for_text."
     )]
     async fn wait_for_stable(
         &self,
@@ -2155,11 +2185,11 @@ mod tests {
         );
         if cfg!(unix) {
             assert!(
-                desc.contains("TSTP/CONT") && !desc.contains("Windows"),
+                desc.contains("USR2") && desc.contains("use STOP") && !desc.contains("Windows"),
                 "{desc}"
             );
             assert!(
-                param.contains("USR2") && !param.contains("Windows"),
+                param.starts_with("Signal name") && !param.contains("Windows"),
                 "{param}"
             );
         } else {
@@ -2169,6 +2199,18 @@ mod tests {
             );
             assert!(param.contains("Only \"INT\" works on Windows"), "{param}");
         }
+    }
+
+    #[test]
+    fn resize_description_is_per_platform() {
+        let tool = TuiServer::router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "resize")
+            .expect("resize is registered");
+        let desc = tool.description.as_deref().unwrap_or_default().to_string();
+        assert!(desc.starts_with("Resize the terminal"), "{desc}");
+        assert_eq!(desc.contains("not reflowed"), cfg!(unix), "{desc}");
     }
 
     #[test]
