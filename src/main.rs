@@ -3,6 +3,23 @@
 //! Start a program under a real PTY (full terminal emulation) or with plain
 //! pipes, then drive it with simulated keyboard / mouse input and read back the
 //! rendered screen as text.
+//!
+//! # Tool descriptions
+//!
+//! Everything a client sees about a tool comes from this file: the text in
+//! `#[tool(description = "...")]`, and every `///` line on an argument-struct
+//! field, line breaks included (a wrapped `///` arrives with `\n` in it). Put
+//! notes for developers in `//` comments, which are not published.
+//!
+//! To give a tool different text per platform, leave `description =` out of
+//! `#[tool]` and write the text as doc lines: rmcp 0.8 then concatenates them
+//! with `"\n"` (each trimmed, empty ones dropped), after `cfg_attr` is
+//! resolved, so `#[cfg_attr(unix, doc = "...")]` adds a line on Unix only.
+//! Keep `#[tool]` first and put no other attribute between the doc lines,
+//! since rmcp-macros drops the doc lines read so far at any other attribute.
+//! Never write `#[cfg_attr(…, tool(…))]`: it compiles but leaves the tool out.
+//! `signal` and `resize` work this way, and their tests check the text on each
+//! platform.
 
 // Shared with build.rs, which stamps it as the exe's FileDescription.
 include!("display_name.rs");
@@ -651,14 +668,8 @@ impl TuiServer {
         Ok(reply(out))
     }
 
-    // The MCP description is built from this method's doc lines, so that each
-    // platform gets only its own text: with no `description =` in `#[tool]`,
-    // rmcp 0.8 joins the doc lines below with "\n" (trimmed, empty ones
-    // dropped), and `cfg_attr` is resolved before the macro reads them.
-    // Keep developer notes in `//` comments here: every `///` line goes to MCP.
-    // Gotchas: rmcp-macros drops the doc lines collected so far at any other
-    // attribute, so keep `#[tool]` first and nothing between the doc lines;
-    // and `#[cfg_attr(…, tool(…))]` would compile but leave the tool out.
+    // Per-platform text built from doc lines: see "Tool descriptions" in the
+    // crate docs at the top of this file before editing them.
     // On Unix, TSTP does nothing because the kernel discards it, not this code:
     // the pty child leads its own session and its parent is outside it, so its
     // process group is orphaned. STOP is not affected. "Only the session's own
@@ -1160,10 +1171,10 @@ impl TuiServer {
         Ok(reply(format!("{hits} match(es):\n{out}")))
     }
 
-    // Built from doc lines so each platform gets its own text, as on `signal`
-    // (see the comment there for the rmcp gotchas). The Unix line exists
-    // because the vt100 emulator does not reflow on resize; ConPTY on Windows
-    // does.
+    // Per-platform text built from doc lines: see "Tool descriptions" in the
+    // crate docs at the top of this file before editing them. The Unix line
+    // exists because the vt100 emulator does not reflow on resize; ConPTY on
+    // Windows does.
     #[tool]
     /// Resize the terminal of a pty session (cols x rows).
     #[cfg_attr(unix, doc = "Existing lines are not reflowed; longer ones are cut.")]
