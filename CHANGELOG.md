@@ -19,7 +19,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `wait_for_text` and `wait_for_output`: `^` and `$` match per line, `\A` and `\z` the whole text
 - Exit status is worded the same in terminal and pipes mode
 - The schema publishes the real parameter defaults instead of `null`
-- Tool descriptions cover the common traps (submitting Enter, per-OS `signal` and `resize`, regex anchors)
+- Tool descriptions cover the common traps (submitting Enter, per-OS `signal` and `resize`, regex anchors, `paste` for multi-line text, hyperlinks in `ansi` output)
 
 ### Fixed
 - A terminal-mode program starts in the reported folder; a `cwd` that does not exist is refused
