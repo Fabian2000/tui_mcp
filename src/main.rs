@@ -251,7 +251,8 @@ struct MouseArgs {
 #[derive(Deserialize, JsonSchema)]
 struct ScreenArgs {
     name: String,
-    /// "text" (plain, default) or "ansi" (with color/attribute escapes).
+    /// "text" (plain, default) or "ansi" (with color/attribute escapes and the
+    /// URIs of hyperlinks on screen).
     #[serde(default)]
     #[schemars(extend("default" = "text"))]
     format: Option<String>,
@@ -846,10 +847,13 @@ impl TuiServer {
         )))
     }
 
+    // The pointer to paste repeats what paste's own text says, on purpose: a
+    // client that loads tools on demand may load send_text alone, and then the
+    // agent never sees that paste exists.
     #[tool(
         description = "Type literal text into the program (no special-key handling). Set \
         delay_ms to pace the characters for programs that drop fast input. Set submit=true \
-        to press Enter afterwards."
+        to press Enter afterwards. For multi-line/indented blocks see the paste tool."
     )]
     async fn send_text(
         &self,
