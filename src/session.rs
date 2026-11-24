@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -132,22 +133,48 @@ fn format_cmdline(opts: &SpawnOpts) -> String {
 
 /// The working directory the child will actually run in: the explicit `cwd` if
 /// given, otherwise the server's current directory (so it can be reproduced).
-fn resolve_cwd(opts: &SpawnOpts) -> String {
-    opts.cwd.clone().unwrap_or_else(|| {
-        std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
-    })
+/// It must be an existing folder, or the spawn is refused.
+///
+/// Both spawn paths pass the result on explicitly, never leaving it unset:
+/// portable-pty (0.9.0, `CommandBuilder`) starts a child with no `cwd`, or
+/// one that fails `is_dir()`, in the home folder (`USERPROFILE` on Windows,
+/// `HOME` or the passwd entry on Unix), not in the server's folder. Without
+/// the check a missing folder would silently become the home folder in pty
+/// mode, while a piped spawn fails with a vaguer OS error.
+///
+/// Kept as a path, not a string: `display()` replaces bytes that aren't valid
+/// UTF-8, so a server folder with such a name would not be found again.
+fn resolve_cwd(opts: &SpawnOpts) -> Result<PathBuf> {
+    let dir = match &opts.cwd {
+        Some(cwd) => PathBuf::from(cwd),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    };
+    if !dir.is_dir() {
+        bail!("cwd is not an existing folder: {}", dir.display());
+    }
+    Ok(dir)
 }
 
-fn build_command(opts: &SpawnOpts) -> CommandBuilder {
+fn build_command(opts: &SpawnOpts, cwd: &Path) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(&opts.command);
     cmd.args(&opts.args);
-    if let Some(cwd) = &opts.cwd {
-        cmd.cwd(cwd);
-    }
+    cmd.cwd(cwd);
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }
     cmd
+}
+
+/// How a program that exited on its own is reported, the same for pty and
+/// piped sessions: `exit code: 3`. A code with the high bit set is a Windows
+/// NTSTATUS (0xC000013A after Ctrl+C, 0xC0000005 after a crash) and is shown
+/// in hex, as std does on Windows, since it is looked up that way.
+fn exit_code_text(code: u32) -> String {
+    if code & 0x8000_0000 == 0 {
+        format!("exit code: {code}")
+    } else {
+        format!("exit code: {code:#x}")
+    }
 }
 
 /// The reply to a cursor-position report request (DSR `CSI 6 n`): the terminal
@@ -159,6 +186,7 @@ fn cursor_position_report(row: u16, col: u16) -> String {
 
 impl PtySession {
     pub fn spawn(opts: &SpawnOpts) -> Result<Self> {
+        let cwd = resolve_cwd(opts)?;
         let pty_system = portable_pty::native_pty_system();
         let size = PtySize {
             rows: opts.rows,
@@ -168,7 +196,7 @@ impl PtySession {
         };
         let pair = pty_system.openpty(size).context("failed to open pty")?;
 
-        let cmd = build_command(opts);
+        let cmd = build_command(opts, &cwd);
         let child = pair
             .slave
             .spawn_command(cmd)
@@ -253,7 +281,7 @@ impl PtySession {
             cols: opts.cols,
             rows: opts.rows,
             cmdline: format_cmdline(opts),
-            cwd: resolve_cwd(opts),
+            cwd: cwd.display().to_string(),
             kitty,
             paste,
             hyperlinks,
@@ -376,9 +404,16 @@ impl PtySession {
     }
 
     /// Exit status if the child has terminated, `None` if still running.
+    /// Worded like the piped one: see `exit_code_text`.
     pub fn exit_status(&mut self) -> Option<String> {
         match self.child.try_wait() {
-            Ok(Some(status)) => Some(format!("{status:?}")),
+            // portable-pty keeps only `strsignal()`'s description of a signal
+            // ("Killed", "Interrupt"), not its number, and sets the code to a
+            // made-up 1 then, so the code is left out.
+            Ok(Some(status)) => Some(match status.signal() {
+                Some(sig) => format!("signal: {sig}"),
+                None => exit_code_text(status.exit_code()),
+            }),
             _ => None,
         }
     }
@@ -398,14 +433,13 @@ pub enum ScreenFormat {
 impl PipedSession {
     pub fn spawn(opts: &SpawnOpts) -> Result<Self> {
         use std::process::{Command, Stdio};
+        let cwd = resolve_cwd(opts)?;
         let mut cmd = Command::new(&opts.command);
         cmd.args(&opts.args)
+            .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(cwd) = &opts.cwd {
-            cmd.current_dir(cwd);
-        }
         for (k, v) in &opts.env {
             cmd.env(k, v);
         }
@@ -431,7 +465,7 @@ impl PipedSession {
             _out_reader: out_reader,
             _err_reader: err_reader,
             cmdline: format_cmdline(opts),
-            cwd: resolve_cwd(opts),
+            cwd: cwd.display().to_string(),
         })
     }
 
@@ -485,9 +519,17 @@ impl PipedSession {
         s
     }
 
+    /// Exit status if the child has terminated, `None` if still running.
+    /// Worded like the pty one: see `exit_code_text`.
     pub fn exit_status(&mut self) -> Option<String> {
         match self.child.try_wait() {
-            Ok(Some(status)) => Some(status.to_string()),
+            // std words an exit code per platform ("exit code: 3" on Windows,
+            // "exit status: 3" on Unix), so only its signal text is kept:
+            // "signal: 9 (SIGKILL)".
+            Ok(Some(status)) => Some(match status.code() {
+                Some(code) => exit_code_text(code.cast_unsigned()),
+                None => status.to_string(),
+            }),
             _ => None,
         }
     }
@@ -649,6 +691,32 @@ impl SessionManager {
             .with_context(|| format!("failed to send signal to pid {pid}"))?;
         Ok(pid)
     }
+
+    /// Type Ctrl+C into a session's program (Windows, which has no signals).
+    ///
+    /// In a pty, Ctrl+C is the byte 0x03, which ConPTY turns into a
+    /// CTRL_C_EVENT for the console's programs. It is written raw, not through
+    /// the key encoding: once a program enables the kitty keyboard protocol,
+    /// ctrl+c is encoded as `ESC[99;5u`, which interrupted nothing in tests
+    /// (2026-11-22), while a raw 0x03 interrupted console programs and Claude
+    /// Code alike. A pipe has no console to turn the byte into an event, so a
+    /// piped session is refused.
+    #[cfg(not(unix))]
+    pub fn interrupt(&self, name: &str) -> Result<()> {
+        self.with(name, |s| match s {
+            Session::Pty(p) => {
+                // A write to a program that has exited succeeds silently.
+                if p.exit_status().is_some() {
+                    bail!("the program in session '{name}' has already exited");
+                }
+                p.write(&[0x03])
+            }
+            Session::Piped(_) => bail!(
+                "a piped session cannot be interrupted on Windows: start the program \
+                 in pty mode, or use session_stop"
+            ),
+        })
+    }
 }
 
 /// A single session's metadata, as reported by [`SessionManager::list`].
@@ -670,6 +738,161 @@ mod tests {
         // DSR reply is `CSI row;col R`, 1-based, row before col.
         assert_eq!(cursor_position_report(0, 0), "\x1b[1;1R");
         assert_eq!(cursor_position_report(24, 79), "\x1b[25;80R");
+    }
+
+    #[test]
+    fn exit_code_text_is_decimal_unless_the_high_bit_is_set() {
+        assert_eq!(exit_code_text(0), "exit code: 0");
+        assert_eq!(exit_code_text(3), "exit code: 3");
+        assert_eq!(exit_code_text(0xC000_013A), "exit code: 0xc000013a");
+    }
+
+    /// Options for a program that exits with code 3 at once.
+    fn exit_3_opts() -> SpawnOpts {
+        #[cfg(windows)]
+        let (command, args) = ("cmd.exe", ["/c", "exit 3"]);
+        #[cfg(unix)]
+        let (command, args) = ("sh", ["-c", "exit 3"]);
+        SpawnOpts {
+            command: command.to_string(),
+            args: args.map(str::to_string).to_vec(),
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 1024,
+        }
+    }
+
+    /// Poll `status` for up to ~5 s until the program has exited.
+    pub(super) fn wait_exited(mut status: impl FnMut() -> Option<String>) -> String {
+        for _ in 0..100 {
+            if let Some(st) = status() {
+                return st;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("program did not exit within 5 s");
+    }
+
+    /// Options for a program that prints its working folder, in `cwd`.
+    fn print_cwd_opts(cwd: Option<String>) -> SpawnOpts {
+        #[cfg(windows)]
+        let (command, args) = ("cmd.exe", ["/c", "cd"]);
+        #[cfg(unix)]
+        let (command, args) = ("sh", ["-c", "pwd -P"]);
+        SpawnOpts {
+            command: command.to_string(),
+            args: args.map(str::to_string).to_vec(),
+            cwd,
+            env: HashMap::new(),
+            cols: 200,
+            rows: 24,
+            buffer_bytes: 4096,
+        }
+    }
+
+    /// Poll `text` for up to ~5 s until it contains `want`; returns the last text.
+    fn wait_contains(want: &str, mut text: impl FnMut() -> String) -> String {
+        let mut last = String::new();
+        for _ in 0..100 {
+            last = text();
+            if last.contains(want) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        last
+    }
+
+    /// Regression test: with no `cwd`, portable-pty started a pty child in the
+    /// home folder while `session_start` reported the server's folder.
+    #[test]
+    fn a_child_without_cwd_starts_in_the_servers_folder() {
+        let here = std::env::current_dir()
+            .expect("current dir")
+            .display()
+            .to_string();
+
+        let mut pty = PtySession::spawn(&print_cwd_opts(None)).expect("spawn under pty");
+        let screen = wait_contains(&here, || pty.dump(ScreenFormat::Text).text);
+        pty.kill();
+        assert!(
+            screen.contains(&here),
+            "pty child printed {screen:?}, expected {here:?}"
+        );
+        assert_eq!(pty.cwd(), here);
+
+        let piped = PipedSession::spawn(&print_cwd_opts(None)).expect("spawn piped");
+        let out = wait_contains(&here, || piped.read_stream(Stream::Stdout, false));
+        assert!(
+            out.contains(&here),
+            "piped child printed {out:?}, expected {here:?}"
+        );
+        assert_eq!(piped.cwd(), here);
+    }
+
+    /// A `cwd` that does not exist is refused in both modes, instead of the pty
+    /// child silently starting in the home folder.
+    #[test]
+    fn a_missing_cwd_is_refused() {
+        let missing = std::env::temp_dir()
+            .join(format!("tui-mcp-no-such-folder-{}", std::process::id()))
+            .display()
+            .to_string();
+        let opts = print_cwd_opts(Some(missing.clone()));
+
+        let Err(pty) = PtySession::spawn(&opts) else {
+            panic!("pty spawn in {missing} should fail");
+        };
+        let Err(piped) = PipedSession::spawn(&opts) else {
+            panic!("piped spawn in {missing} should fail");
+        };
+        for e in [pty, piped] {
+            assert_eq!(
+                e.to_string(),
+                format!("cwd is not an existing folder: {missing}")
+            );
+        }
+    }
+
+    /// A piped program waiting for a line gets it from the Enter key: `\n`,
+    /// not the `\r` a terminal sends (which no line reader ends a line on).
+    #[test]
+    fn a_piped_program_reads_a_line_ended_by_enter() {
+        #[cfg(windows)]
+        let (command, args) = ("cmd.exe", vec!["/v:on", "/c", "set /p L=& echo got:!L!."]);
+        #[cfg(unix)]
+        let (command, args) = ("sh", vec!["-c", "read L; echo got:$L."]);
+        let opts = SpawnOpts {
+            command: command.to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 4096,
+        };
+        let mut piped = PipedSession::spawn(&opts).expect("spawn piped");
+        let enter = crate::keys::piped_key_to_bytes("enter", crate::keys::Mods::default())
+            .expect("enter is a key");
+        piped.write(b"abc").expect("write text");
+        piped.write(&enter).expect("write enter");
+
+        let out = wait_contains("got:abc.", || piped.read_stream(Stream::Stdout, false));
+        piped.kill();
+        assert!(out.contains("got:abc."), "piped program printed {out:?}");
+    }
+
+    #[test]
+    fn pty_and_piped_word_an_exit_code_the_same() {
+        let mut pty = PtySession::spawn(&exit_3_opts()).expect("spawn under pty");
+        let pty_status = wait_exited(|| pty.exit_status());
+        let mut piped = PipedSession::spawn(&exit_3_opts()).expect("spawn piped");
+        let piped_status = wait_exited(|| piped.exit_status());
+
+        assert_eq!(pty_status, "exit code: 3");
+        assert_eq!(piped_status, "exit code: 3");
     }
 }
 
@@ -718,6 +941,31 @@ mod windows_pty_tests {
 #[cfg(all(test, unix))]
 mod unix_pty_tests {
     use super::*;
+
+    /// A program killed by a signal reads `signal: ...` in both modes, with no
+    /// exit code beside it (portable-pty's code is a made-up 1 then).
+    #[test]
+    fn a_signal_death_is_worded_as_a_signal() {
+        let opts = || SpawnOpts {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "kill -9 $$".to_string()],
+            cwd: None,
+            env: HashMap::new(),
+            cols: 80,
+            rows: 24,
+            buffer_bytes: 1024,
+        };
+        let mut pty = PtySession::spawn(&opts()).expect("spawn under pty");
+        let pty_status = super::tests::wait_exited(|| pty.exit_status());
+        let mut piped = PipedSession::spawn(&opts()).expect("spawn piped");
+        let piped_status = super::tests::wait_exited(|| piped.exit_status());
+
+        assert!(
+            pty_status.starts_with("signal: ") && !pty_status.contains("code"),
+            "pty: {pty_status:?}"
+        );
+        assert_eq!(piped_status, "signal: 9 (SIGKILL)");
+    }
 
     /// Unix counterpart to `interactive_cmd_renders_under_pty`: a program that
     /// emits a cursor-position request (DSR `CSI 6 n`) on its output must get

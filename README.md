@@ -129,13 +129,13 @@ Check your client's own documentation for the exact location and format.
 | Tool | Purpose |
 |------|---------|
 | `session_start` | Spawn a program. `mode: "pty"` (default, real TUI) or `"piped"` (separate stdout/stderr, no TTY). |
-| `session_list` | List sessions with kind, command, cwd and exit status. |
+| `session_list` | List sessions with kind, command, cwd and exit status (`running`, `exit code: N`, or on Unix `signal: ...`). |
 | `session_stop` | Kill and remove a session. |
 | `session_purge` | Remove all sessions whose program has already exited. |
-| `signal` | Send an OS signal (INT, TERM, HUP, TSTP, CONT, WINCH, USR1, ...) to a session's process (Unix). |
+| `signal` | Send an OS signal (INT, TERM, HUP, TSTP, CONT, WINCH, USR1, ...) to a session's process. On Windows only `INT` works, in pty mode: it types Ctrl+C (byte `0x03`). |
 | `send_key` | Named key plus ctrl/alt/shift modifiers, optional repeat `count`. |
 | `send_keys` | A sequence of key presses in one call, e.g. `["ctrl+c", "enter"]` (optional `delay_ms`). |
-| `send_text` | Type literal text (optional `delay_ms` to pace characters). |
+| `send_text` | Type literal text (optional `delay_ms` to pace characters, `submit` to press Enter afterwards). |
 | `paste` | Paste multi-line text. Wraps in bracketed-paste markers when the program enabled the mode. |
 | `send_bytes` | Raw bytes with `\n \r \t \e \xHH` escapes, for anything the key and mouse tools don't cover. |
 | `send_mouse` | Click, scroll, drag, or hover at 1-based `(x, y)` (SGR mouse reporting). `count` repeats the action (`count: 2` = double-click); `delay_ms` spaces the repeats. |
@@ -150,7 +150,7 @@ Check your client's own documentation for the exact location and format.
 | `wait_for_text` | Block until text appears on screen. `regex` matches a pattern, `absent` waits for it to disappear. `format` controls the returned screen (`none`/`text`/`ansi`). |
 | `wait_for_stable` | Block until the screen stops changing (with timeout). `format` controls the returned screen (`none`/`text`/`ansi`). |
 | `wait_for_change` | Block until the screen changes from its current contents. `format` controls the returned screen (`none`/`text`/`ansi`). If screen is not changed &ndash; just returns status line. |
-| `wait_for_exit` | Block until the program exits. Returns the exit status (pty or piped). |
+| `wait_for_exit` | Block until the program exits. Returns the exit status: `exit code: N` in both modes, or on Unix `signal: ...` (pty: the signal's description, piped: its number and name). |
 | `wait_for_output` | Block until a piped session's stdout/stderr contains text or a regex match. |
 | `sleep` | Fixed wait, capped by `max_ms` (hard cap 60 s). |
 

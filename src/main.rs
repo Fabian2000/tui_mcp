@@ -3,6 +3,23 @@
 //! Start a program under a real PTY (full terminal emulation) or with plain
 //! pipes, then drive it with simulated keyboard / mouse input and read back the
 //! rendered screen as text.
+//!
+//! # Tool descriptions
+//!
+//! Everything a client sees about a tool comes from this file: the text in
+//! `#[tool(description = "...")]`, and every `///` line on an argument-struct
+//! field, line breaks included (a wrapped `///` arrives with `\n` in it). Put
+//! notes for developers in `//` comments, which are not published.
+//!
+//! To give a tool different text per platform, leave `description =` out of
+//! `#[tool]` and write the text as doc lines: rmcp 0.8 then concatenates them
+//! with `"\n"` (each trimmed, empty ones dropped), after `cfg_attr` is
+//! resolved, so `#[cfg_attr(unix, doc = "...")]` adds a line on Unix only.
+//! Keep `#[tool]` first and put no other attribute between the doc lines,
+//! since rmcp-macros drops the doc lines read so far at any other attribute.
+//! Never write `#[cfg_attr(…, tool(…))]`: it compiles but leaves the tool out.
+//! `signal` and `resize` work this way, and their tests check the text on each
+//! platform.
 
 // Shared with build.rs, which stamps it as the exe's FileDescription.
 include!("display_name.rs");
@@ -17,6 +34,8 @@ mod render;
 mod schema;
 mod session;
 mod wait;
+#[cfg(windows)]
+mod windows_ctrl_c;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -36,6 +55,45 @@ use wait::{POLL_INTERVAL_MS, WaitReturn, round_ms, sample_screen, wait_reply};
 
 // ---- Tool input schemas ----------------------------------------------------
 
+// Defaults of optional parameters. Each is used twice: the handler falls back to
+// it, and `#[schemars(extend("default" = …))]` states it in the tool's input
+// schema. Without the `extend`, `#[serde(default)]` on an `Option` field makes
+// schemars publish `"default": null`, which contradicts the "(default N)" in the
+// description. Optional fields with no fixed default (`cwd`, `page`) drop
+// `#[serde(default)]` instead, so the schema has no `default` key at all; serde
+// still treats a missing `Option` field as `None`.
+const DEFAULT_TIMEOUT_MS: u64 = 5000;
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+const DEFAULT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_COUNT: u32 = 1;
+const DEFAULT_DELAY_MS: u64 = 0;
+const DEFAULT_MOUSE_ACTION: &str = "left";
+const DEFAULT_STABLE_MS: u64 = 300;
+const DEFAULT_PAGE_SIZE: usize = 100;
+const DEFAULT_MAX_RESULTS: usize = 50;
+const DEFAULT_CONTEXT_LINES: usize = 0;
+const MAX_SLEEP_MS: u64 = 60_000;
+
+/// Wait between the text and the Enter of `send_text` with `submit`.
+///
+/// Some programs whose input box takes multi-line text need a pause before
+/// the Enter: when the text and the Enter arrive within one read, they take
+/// the burst as typed or pasted text and keep the Enter as a line break
+/// instead of submitting. Measured 2026-11-23 with the Claude Code TUI
+/// (2.1.330) on Windows 11 (ConPTY) and on WSL2 Ubuntu 24.04, prompts of
+/// about 120 to 5,700 characters: with the Enter written separately but
+/// right after the text, all 9 trials failed to submit (the Enter landed in
+/// the input box as a newline, or as part of a paste); with a wait of 5, 20
+/// or 50 ms, all 32 submitted. 20 ms keeps a margin over the 5 ms that
+/// already worked. Microsoft Edit, GNU nano and the Antigravity CLI took the
+/// Enter correctly even in the same write as the text.
+const SUBMIT_WAIT_MS: u64 = 20;
+
+// The `///` lines on these argument structs, and the tool descriptions below,
+// make up the schema every client loads into each session: keep them short,
+// and add a caveat only for a trap agents actually hit.
+
 #[derive(Deserialize, JsonSchema)]
 struct StartArgs {
     /// Unique name to refer to this session in later calls.
@@ -45,25 +103,34 @@ struct StartArgs {
     /// Arguments passed to the program.
     #[serde(default)]
     args: Vec<String>,
-    /// Working directory.
-    #[serde(default)]
+    // The default is the folder this server process was started in. The client
+    // sets that folder, and it is not always the agent's own (seen: for a
+    // session the Claude Code Desktop app created in a new git worktree, it
+    // was the main checkout; `claude -w` gets the worktree). The text
+    // avoids "the server's": an agent only sees a list of tools.
+    /// Working directory. Set it: the default may differ from your current
+    /// directory.
     cwd: Option<String>,
     /// Extra environment variables.
     #[serde(default)]
     env: HashMap<String, String>,
-    /// Terminal columns (pty mode). Default 80.
+    /// Terminal columns (pty mode). Default 80; wider avoids wrapped lines.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_COLS))]
     cols: Option<u16>,
     /// Terminal rows (pty mode). Default 24.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_ROWS))]
     rows: Option<u16>,
     /// "pty" (default, real terminal for TUIs) or "piped" (separate
     /// stdout/stderr, no TTY).
     #[serde(default)]
+    #[schemars(extend("default" = "pty"))]
     mode: Option<String>,
     /// Per-stream output buffer cap in bytes for piped mode (ring buffer,
     /// oldest bytes drop when exceeded). Default 2 MiB.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_BUFFER_BYTES))]
     buffer_bytes: Option<usize>,
 }
 
@@ -92,6 +159,7 @@ struct SendKeyArgs {
     modifiers: Vec<String>,
     /// Repeat the key this many times (default 1).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_COUNT))]
     count: Option<u32>,
 }
 
@@ -104,25 +172,35 @@ struct SendKeysArgs {
     keys: Vec<String>,
     /// Optional delay between key presses in milliseconds. Omit or 0 for none.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_DELAY_MS))]
     delay_ms: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct SendTextArgs {
     name: String,
-    /// Literal text typed verbatim into the program.
+    /// Literal text typed verbatim into the program. A newline in it is a line
+    /// feed, which not every program takes as Enter; set `submit` to submit.
     text: String,
     /// Optional delay between characters in milliseconds, to pace input for
     /// programs that drop fast bursts. Omit or 0 to send it all at once.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_DELAY_MS))]
     delay_ms: Option<u64>,
+    /// Also press Enter after the text, written separately after a short pause,
+    /// so the program submits the line. Prefer this to ending `text` with a
+    /// newline, which some programs take as part of the text instead of a
+    /// submit.
+    #[serde(default)]
+    #[schemars(extend("default" = false))]
+    submit: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct SignalArgs {
     name: String,
-    /// Signal name, e.g. "INT", "TERM", "HUP", "KILL", "TSTP", "CONT",
-    /// "WINCH", "USR1", "USR2" (a leading "SIG" is also accepted).
+    #[cfg_attr(unix, doc = "Signal name, e.g. \"INT\".")]
+    #[cfg_attr(not(unix), doc = "Signal name. Only \"INT\" works on Windows.")]
     signal: String,
 }
 
@@ -138,7 +216,8 @@ struct PasteArgs {
 #[derive(Deserialize, JsonSchema)]
 struct SendBytesArgs {
     name: String,
-    /// Bytes with C-style escapes: \n \r \t \0 \e (ESC) \xHH \\.
+    /// Bytes with C-style escapes: \n \r \t \0 \e (ESC) \xHH \\. Double every
+    /// literal backslash, or it starts an escape.
     data: String,
 }
 
@@ -152,24 +231,30 @@ struct MouseArgs {
     /// One of: `left`, `right`, `middle`, `scroll_up`, `scroll_down`, `down`,
     /// `up`, `move`/`drag`, `hover`.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_MOUSE_ACTION))]
     action: Option<String>,
+    /// Any of "ctrl", "alt", "shift".
     #[serde(default)]
     modifiers: Vec<String>,
     /// Repeat the whole action this many times in one call (count=2
     /// double-click, 3 triple). Default 1.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_COUNT))]
     count: Option<u32>,
     /// Gap in ms between repeats (only when count > 1). Omit/0 for a zero-gap
     /// burst (double-click); non-zero spaces them into distinct events.
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_DELAY_MS))]
     delay_ms: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct ScreenArgs {
     name: String,
-    /// "text" (plain, default) or "ansi" (with color/attribute escapes).
+    /// "text" (plain, default) or "ansi" (with color/attribute escapes and the
+    /// URIs of hyperlinks on screen).
     #[serde(default)]
+    #[schemars(extend("default" = "text"))]
     format: Option<String>,
 }
 
@@ -185,9 +270,11 @@ struct ReadStreamArgs {
     name: String,
     /// "stdout" (default) or "stderr".
     #[serde(default)]
+    #[schemars(extend("default" = "stdout"))]
     stream: Option<String>,
     /// If true, clear the buffer after reading (default false).
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     clear: Option<bool>,
 }
 
@@ -195,18 +282,31 @@ struct ReadStreamArgs {
 struct WaitTextArgs {
     name: String,
     /// Text to wait for on screen (substring, or regex if `regex` is true).
+    /// Don't end it with a space: trailing spaces may be trimmed.
     text: String,
-    /// Treat `text` as a regular expression instead of a literal substring.
+    // A screen line is not always one row: the emulator returns a row whose
+    // text wrapped past the last column and the next row as one line. Any long
+    // line does it; ConPTY on Windows pads its rows to full width, so there it
+    // is common.
+    /// Treat `text` as a regular expression instead of a literal substring. The
+    /// pattern runs in multi-line mode: `^` and `$` match at the start and end of
+    /// each screen line, not only of the whole screen (use `\A` and `\z` for
+    /// those). A row whose text wraps into the next one has no line break after
+    /// it, so `^`/`$` don't match at that row edge.
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     regex: Option<bool>,
     /// Wait for the text to be ABSENT (disappear) instead of present.
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     absent: Option<bool>,
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
-    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
-    /// default), or "ansi" (with color/attribute escapes).
+    /// Screen to return once resolved: "none" (outcome only, no screen
+    /// content), "text" (plain, default), or "ansi" (with color/attribute
+    /// escapes).
     #[serde(default)]
     format: WaitReturn,
 }
@@ -216,9 +316,11 @@ struct WaitChangeArgs {
     name: String,
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
-    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
-    /// default), or "ansi" (with color/attribute escapes).
+    /// Screen to return once resolved: "none" (outcome only, no screen
+    /// content), "text" (plain, default), or "ansi" (with color/attribute
+    /// escapes).
     #[serde(default)]
     format: WaitReturn,
 }
@@ -228,6 +330,7 @@ struct WaitExitArgs {
     name: String,
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
 }
 
@@ -238,12 +341,17 @@ struct WaitOutputArgs {
     text: String,
     /// Which piped stream to watch: "stdout" (default) or "stderr".
     #[serde(default)]
+    #[schemars(extend("default" = "stdout"))]
     stream: Option<String>,
-    /// Treat `text` as a regular expression.
+    /// Treat `text` as a regular expression. The pattern runs in multi-line
+    /// mode: `^` and `$` match at the start and end of each output line, not
+    /// only of the whole buffer (use `\A` and `\z` for those).
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     regex: Option<bool>,
     /// Max time to wait in milliseconds (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
 }
 
@@ -252,12 +360,15 @@ struct WaitStableArgs {
     name: String,
     /// Screen must be unchanged for this many ms (default 300).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_STABLE_MS))]
     stable_ms: Option<u64>,
     /// Give up after this many ms (default 5000).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_TIMEOUT_MS))]
     timeout_ms: Option<u64>,
-    /// Screen to return once resolved: "none" (outcome only), "text" (plain,
-    /// default), or "ansi" (with color/attribute escapes).
+    /// Screen to return once resolved: "none" (outcome only, no screen
+    /// content), "text" (plain, default), or "ansi" (with color/attribute
+    /// escapes).
     #[serde(default)]
     format: WaitReturn,
 }
@@ -267,9 +378,9 @@ struct ScrollbackArgs {
     name: String,
     /// Lines per page (default 100).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_PAGE_SIZE))]
     page_size: Option<usize>,
     /// 0-based page index. Omit to get the most recent page (the tail).
-    #[serde(default)]
     page: Option<usize>,
 }
 
@@ -280,12 +391,15 @@ struct SearchArgs {
     pattern: String,
     /// Case-insensitive matching (default false).
     #[serde(default)]
+    #[schemars(extend("default" = false))]
     ignore_case: Option<bool>,
     /// Max matching lines to return (default 50).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_MAX_RESULTS))]
     max_results: Option<usize>,
     /// Lines of context to include before and after each match (default 0).
     #[serde(default)]
+    #[schemars(extend("default" = DEFAULT_CONTEXT_LINES))]
     context: Option<usize>,
 }
 
@@ -295,6 +409,7 @@ struct SleepArgs {
     ms: u64,
     /// Upper bound on the sleep, in milliseconds (default and hard cap: 60000).
     #[serde(default)]
+    #[schemars(extend("default" = MAX_SLEEP_MS))]
     max_ms: Option<u64>,
 }
 
@@ -335,23 +450,38 @@ fn parse_combo(combo: &str) -> (String, Mods) {
     (key, Mods::from_list(&mods))
 }
 
-/// Resolve a key + modifiers to bytes for a session, using kitty encoding when
-/// the (pty) session has the protocol enabled, else the legacy encoding.
+/// Resolve a key + modifiers to bytes for a session: kitty encoding when the
+/// pty session has the protocol enabled, else the legacy encoding; a piped
+/// session gets `keys::piped_key_to_bytes`.
 fn key_bytes_for(session: &session::Session, key: &str, mods: Mods) -> Option<Vec<u8>> {
-    let legacy = key_to_bytes(key, mods)?;
     Some(match session {
-        Session::Pty(p) => keys::kitty_encode(key, mods, p.kitty_flags()).unwrap_or(legacy),
-        Session::Piped(_) => legacy,
+        Session::Pty(p) => {
+            let legacy = key_to_bytes(key, mods)?;
+            keys::kitty_encode(key, mods, p.kitty_flags()).unwrap_or(legacy)
+        }
+        Session::Piped(_) => keys::piped_key_to_bytes(key, mods)?,
     })
+}
+
+/// Valid signal names for the `signal` tool, without the "SIG" prefix.
+const SIGNAL_NAMES: [&str; 11] = [
+    "INT", "TERM", "KILL", "HUP", "QUIT", "TSTP", "CONT", "STOP", "WINCH", "USR1", "USR2",
+];
+
+/// A known signal name in its canonical form (upper case, no "SIG" prefix), or
+/// `None` for an unknown one. Platform-neutral, so Windows rejects an unknown
+/// name the same way Unix does.
+fn normalize_signal(name: &str) -> Option<&'static str> {
+    let n = name.trim().to_ascii_uppercase();
+    let n = n.strip_prefix("SIG").unwrap_or(&n);
+    SIGNAL_NAMES.iter().copied().find(|&s| s == n)
 }
 
 /// Map a signal name (with or without a leading "SIG") to a nix signal.
 #[cfg(unix)]
 fn parse_signal(name: &str) -> Option<nix::sys::signal::Signal> {
     use nix::sys::signal::Signal;
-    let n = name.trim().to_ascii_uppercase();
-    let n = n.strip_prefix("SIG").unwrap_or(&n);
-    Some(match n {
+    Some(match normalize_signal(name)? {
         "INT" => Signal::SIGINT,
         "TERM" => Signal::SIGTERM,
         "KILL" => Signal::SIGKILL,
@@ -445,6 +575,20 @@ async fn write_png(path: &std::path::Path, png: &[u8]) -> std::io::Result<std::p
     ))
 }
 
+/// Compile a `wait_for_text` or `wait_for_output` pattern. The screen, and a
+/// piped stream's buffer, is one string with a line break per line, so in the
+/// default single-line mode `$` matched only at the very end and a pattern like
+/// `done 3:16 PM$` could never match a line in the middle. Multi-line mode makes
+/// `^` and `$` work per line; `\A` and `\z` still anchor to the whole text.
+/// CRLF mode lets `$` match before a `\r\n` too, as Windows programs write it to
+/// a pipe; without it `foo$` would miss `foo\r\n`.
+fn line_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .multi_line(true)
+        .crlf(true)
+        .build()
+}
+
 fn screen_format(s: Option<&str>) -> ScreenFormat {
     match s {
         Some("ansi") => ScreenFormat::Ansi,
@@ -488,9 +632,9 @@ impl TuiServer {
             args: a.args,
             cwd: a.cwd,
             env: a.env,
-            cols: a.cols.unwrap_or(80),
-            rows: a.rows.unwrap_or(24),
-            buffer_bytes: a.buffer_bytes.unwrap_or(2 * 1024 * 1024),
+            cols: a.cols.unwrap_or(DEFAULT_COLS),
+            rows: a.rows.unwrap_or(DEFAULT_ROWS),
+            buffer_bytes: a.buffer_bytes.unwrap_or(DEFAULT_BUFFER_BYTES),
         };
         let (cmdline, cwd) = self
             .sessions
@@ -526,30 +670,58 @@ impl TuiServer {
         Ok(reply(out))
     }
 
-    #[tool(
-        description = "Send an OS signal to a session's process (Unix only). Signal names: \
-        INT, TERM, KILL, HUP, QUIT, TSTP, CONT, STOP, WINCH, USR1, USR2 (leading 'SIG' \
-        optional). Useful for testing signal handlers, graceful shutdown (TERM), config \
-        reload (HUP), or suspend/resume (TSTP/CONT). The session is not removed."
+    // Per-platform text built from doc lines: see "Tool descriptions" in the
+    // crate docs at the top of this file before editing them.
+    // On Unix, TSTP does nothing because the kernel discards it, not this code:
+    // the pty child leads its own session and its parent is outside it, so its
+    // process group is orphaned. STOP is not affected. "Only the session's own
+    // process" because the signal goes to one pid, not to the terminal's
+    // foreground process group.
+    #[tool]
+    /// Send a signal to a session's program. The session is not removed.
+    #[cfg_attr(
+        unix,
+        doc = "Signal names: INT, TERM, KILL, HUP, QUIT, TSTP, CONT, STOP, WINCH, USR1, \
+        USR2 (leading 'SIG' optional). Only the session's own process gets it; for a \
+        command inside a shell send Ctrl+C with send_key. To suspend use STOP; TSTP \
+        does nothing in pty mode."
+    )]
+    #[cfg_attr(
+        not(unix),
+        doc = "Windows has no signals: only INT works, and only in pty mode, where it \
+        types Ctrl+C (byte 0x03), even when the program uses the kitty keyboard \
+        protocol. A piped session cannot be interrupted; use session_stop."
     )]
     async fn signal(
         &self,
         Parameters(a): Parameters<SignalArgs>,
     ) -> Result<CallToolResult, McpError> {
+        let unknown = || McpError::invalid_params(format!("unknown signal '{}'", a.signal), None);
         #[cfg(unix)]
         {
-            let sig = parse_signal(&a.signal).ok_or_else(|| {
-                McpError::invalid_params(format!("unknown signal '{}'", a.signal), None)
-            })?;
+            let sig = parse_signal(&a.signal).ok_or_else(unknown)?;
             let pid = self.sessions.signal(&a.name, sig).map_err(|e| err(&e))?;
             Ok(reply(format!("sent {sig:?} to pid {pid}")))
         }
         #[cfg(not(unix))]
         {
-            let _ = (&a.name, &a.signal);
-            Err(McpError::invalid_params(
-                "signals are only supported on Unix platforms".to_string(),
-                None,
+            // INT becomes a typed Ctrl+C (see `SessionManager::interrupt`),
+            // every other signal is refused.
+            let sig = normalize_signal(&a.signal).ok_or_else(unknown)?;
+            if sig != "INT" {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "signal {sig} is not supported on Windows: only INT works, in pty \
+                         mode, where it types Ctrl+C; use session_stop to end the program"
+                    ),
+                    None,
+                ));
+            }
+            self.sessions.interrupt(&a.name).map_err(|e| err(&e))?;
+            Ok(reply(
+                "typed Ctrl+C (byte 0x03) into the session: Windows has no signals. The \
+                 program may handle or ignore it, so it can still be running; check with \
+                 wait_for_exit or read_screen.",
             ))
         }
     }
@@ -593,7 +765,7 @@ impl TuiServer {
         // encoding as the fallback byte sequence.
         let legacy = key_to_bytes(&a.key, mods)
             .ok_or_else(|| McpError::invalid_params(format!("unknown key '{}'", a.key), None))?;
-        let count = a.count.unwrap_or(1).max(1);
+        let count = a.count.unwrap_or(DEFAULT_COUNT).max(1);
         let mut kitty_used = false;
         self.sessions
             .with(&a.name, |s| {
@@ -605,7 +777,11 @@ impl TuiServer {
                         }
                         None => legacy.clone(),
                     },
-                    Session::Piped(_) => legacy.clone(),
+                    // The key is known (checked above), and piped_key_to_bytes
+                    // knows the same keys, so the fallback never runs.
+                    Session::Piped(_) => {
+                        keys::piped_key_to_bytes(&a.key, mods).unwrap_or_else(|| legacy.clone())
+                    }
                 };
                 for _ in 0..count {
                     write_session(s, &bytes)?;
@@ -639,7 +815,7 @@ impl TuiServer {
                 ));
             }
         }
-        let delay = a.delay_ms.unwrap_or(0);
+        let delay = a.delay_ms.unwrap_or(DEFAULT_DELAY_MS);
         if delay > 0 {
             for (key, mods) in &parsed {
                 self.sessions
@@ -671,9 +847,13 @@ impl TuiServer {
         )))
     }
 
+    // The pointer to paste repeats what paste's own text says, on purpose: a
+    // client that loads tools on demand may load send_text alone, and then the
+    // agent never sees that paste exists.
     #[tool(
         description = "Type literal text into the program (no special-key handling). Set \
-        delay_ms to pace the characters for programs that drop fast input."
+        delay_ms to pace the characters for programs that drop fast input. Set submit=true \
+        to press Enter afterwards. For multi-line/indented blocks see the paste tool."
     )]
     async fn send_text(
         &self,
@@ -697,7 +877,25 @@ impl TuiServer {
                     .map_err(|e| err(&e))?;
             }
         }
-        Ok(reply("text sent"))
+        if !a.submit.unwrap_or(false) {
+            return Ok(reply("text sent"));
+        }
+        // As on the delay_ms paths, the session lock is released during the
+        // wait, so a concurrent write to the same session can land between the
+        // text and the Enter.
+        tokio::time::sleep(std::time::Duration::from_millis(SUBMIT_WAIT_MS)).await;
+        // Same bytes as `send_key enter`: kitty-encoded when the program enabled
+        // it, `\n` in pipes mode.
+        self.sessions
+            .with(&a.name, |s| {
+                let bytes =
+                    key_bytes_for(s, "enter", Mods::default()).expect("enter is a known key");
+                write_session(s, &bytes)
+            })
+            // The error reports that the text is already typed, so the caller
+            // retries only the Enter instead of typing the text twice.
+            .map_err(|e| err(&anyhow::anyhow!("text sent, but Enter failed: {e}")))?;
+        Ok(reply("text sent, then Enter"))
     }
 
     #[tool(
@@ -759,13 +957,13 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<MouseArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let action_name = a.action.as_deref().unwrap_or("left");
+        let action_name = a.action.as_deref().unwrap_or(DEFAULT_MOUSE_ACTION);
         let action = parse_action(action_name).ok_or_else(|| {
             McpError::invalid_params(format!("unknown mouse action '{action_name}'"), None)
         })?;
         let mods = Mods::from_list(&a.modifiers);
-        let count = a.count.unwrap_or(1).max(1);
-        let delay = a.delay_ms.unwrap_or(0);
+        let count = a.count.unwrap_or(DEFAULT_COUNT).max(1);
+        let delay = a.delay_ms.unwrap_or(DEFAULT_DELAY_MS);
         let seqs = action_to_bytes(action, a.x, a.y, mods);
         // Mirrors send_keys: with no delay, write every cycle under a single lock
         // hold so the burst can't be interleaved by another tool call (a
@@ -806,7 +1004,7 @@ impl TuiServer {
     #[tool(
         description = "Read the current terminal screen as text (pty sessions only). \
         format='text' (default) or 'ansi' for colors/attributes. Includes a status \
-        line with size and cursor position."
+        line with size and 0-based cursor position."
     )]
     async fn read_screen(
         &self,
@@ -827,8 +1025,8 @@ impl TuiServer {
 
     #[tool(
         description = "Take a PNG screenshot of the pty screen, for checking colors / \
-        layout. PREFER read_screen (plain text) when you only need the content, since it is \
-        much cheaper in tokens. Use this only when color or visual layout matters."
+        layout; returns the image only, no text. PREFER read_screen (plain text) when you \
+        only need the content, since it is much cheaper in tokens."
     )]
     async fn screenshot(
         &self,
@@ -901,7 +1099,7 @@ impl TuiServer {
             .map_err(|e| err(&e))?;
 
         let total = lines.len();
-        let page_size = a.page_size.unwrap_or(100).max(1);
+        let page_size = a.page_size.unwrap_or(DEFAULT_PAGE_SIZE).max(1);
         let total_pages = total.div_ceil(page_size).max(1);
         let page = a
             .page
@@ -936,8 +1134,8 @@ impl TuiServer {
             .case_insensitive(a.ignore_case.unwrap_or(false))
             .build()
             .map_err(|e| McpError::invalid_params(format!("bad regex: {e}"), None))?;
-        let max = a.max_results.unwrap_or(50).max(1);
-        let ctx = a.context.unwrap_or(0);
+        let max = a.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1);
+        let ctx = a.context.unwrap_or(DEFAULT_CONTEXT_LINES);
 
         let lines = self
             .sessions
@@ -978,7 +1176,13 @@ impl TuiServer {
         Ok(reply(format!("{hits} match(es):\n{out}")))
     }
 
-    #[tool(description = "Resize the terminal of a pty session (cols x rows).")]
+    // Per-platform text built from doc lines: see "Tool descriptions" in the
+    // crate docs at the top of this file before editing them. The Unix line
+    // exists because the vt100 emulator does not reflow on resize; ConPTY on
+    // Windows does.
+    #[tool]
+    /// Resize the terminal of a pty session (cols x rows).
+    #[cfg_attr(unix, doc = "Existing lines are not reflowed; longer ones are cut.")]
     async fn resize(
         &self,
         Parameters(a): Parameters<ResizeArgs>,
@@ -1038,7 +1242,7 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<SleepArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let cap = a.max_ms.unwrap_or(60_000).min(60_000);
+        let cap = a.max_ms.unwrap_or(MAX_SLEEP_MS).min(MAX_SLEEP_MS);
         let ms = a.ms.min(cap);
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         Ok(reply(format!("slept {ms}ms")))
@@ -1048,18 +1252,18 @@ impl TuiServer {
         description = "Block until text appears on the screen (pty sessions), then return \
         the screen. Set regex=true to match a pattern, or absent=true to instead wait for \
         the text to DISAPPEAR (e.g. a 'Loading...' spinner). Use this to synchronize with \
-        the program instead of guessing delays."
+        the program instead of guessing delays. Text already on screen matches at once."
     )]
     async fn wait_for_text(
         &self,
         Parameters(a): Parameters<WaitTextArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let absent = a.absent.unwrap_or(false);
         let format = a.format;
         let re = if a.regex.unwrap_or(false) {
             Some(
-                regex::Regex::new(&a.text)
+                line_regex(&a.text)
                     .map_err(|e| McpError::invalid_params(format!("bad regex: {e}"), None))?,
             )
         } else {
@@ -1109,7 +1313,7 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<WaitChangeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let format = a.format;
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_millis(timeout);
@@ -1160,7 +1364,7 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<WaitExitArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout);
         loop {
             let status = self
@@ -1190,14 +1394,14 @@ impl TuiServer {
         &self,
         Parameters(a): Parameters<WaitOutputArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let which = match a.stream.as_deref() {
             Some("stderr") => Stream::Stderr,
             _ => Stream::Stdout,
         };
         let re = if a.regex.unwrap_or(false) {
             Some(
-                regex::Regex::new(&a.text)
+                line_regex(&a.text)
                     .map_err(|e| McpError::invalid_params(format!("bad regex: {e}"), None))?,
             )
         } else {
@@ -1232,14 +1436,15 @@ impl TuiServer {
 
     #[tool(
         description = "Block until the screen stops changing for `stable_ms`, or until \
-        timeout (pty sessions). Useful to wait for a program to finish redrawing."
+        timeout (pty sessions). Useful to wait for a program to finish redrawing. Never \
+        settles while a spinner or clock animates: use wait_for_text."
     )]
     async fn wait_for_stable(
         &self,
         Parameters(a): Parameters<WaitStableArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let stable_ms = a.stable_ms.unwrap_or(300);
-        let timeout = a.timeout_ms.unwrap_or(5000);
+        let stable_ms = a.stable_ms.unwrap_or(DEFAULT_STABLE_MS);
+        let timeout = a.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let format = a.format;
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_millis(timeout);
@@ -1418,6 +1623,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    #[cfg(windows)]
+    if !windows_ctrl_c::pass_to_children() {
+        tracing::warn!("could not clear an inherited \"ignore Ctrl+C\" flag");
+    }
+
     let service = TuiServer::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -1501,6 +1711,30 @@ mod tests {
         // A lone "+" has no modifiers and is treated as the key itself.
         let (key, _mods) = parse_combo("+");
         assert_eq!(key, "+");
+    }
+
+    #[test]
+    fn line_regex_anchors_per_line() {
+        let screen = "✻ Churned for 10s · done 3:16 PM\n> \nfooter";
+        // `$` and `^` match at a line in the middle of the screen.
+        assert!(line_regex("done 3:16 PM$").unwrap().is_match(screen));
+        assert!(line_regex("^> $").unwrap().is_match(screen));
+        // `\A` and `\z` still anchor to the whole screen.
+        assert!(!line_regex(r"done 3:16 PM\z").unwrap().is_match(screen));
+        assert!(line_regex(r"footer\z").unwrap().is_match(screen));
+        assert!(!line_regex(r"\A> ").unwrap().is_match(screen));
+    }
+
+    #[test]
+    fn line_regex_anchors_before_crlf() {
+        let output = "building\r\ndone in 3s\r\nexit\r\n";
+        assert!(line_regex("^done in 3s$").unwrap().is_match(output));
+        assert!(line_regex(r"exit\r?\n\z").unwrap().is_match(output));
+    }
+
+    #[test]
+    fn line_regex_reports_bad_patterns() {
+        assert!(line_regex("(unclosed").is_err());
     }
 
     #[test]
@@ -1630,6 +1864,84 @@ mod tests {
         assert_eq!(out, format!("{cycle}{cycle}"));
 
         srv.sessions.remove("catsess").ok();
+    }
+
+    /// Fails if `send_text` with `submit` writes the text and the Enter in one
+    /// write, drops the wait between them, or sends an Enter other than `\n`
+    /// to a piped session; see `SUBMIT_WAIT_MS` for why they are separate.
+    /// As in the `send_mouse` delay test below, the future is driven only
+    /// partway, parked on its wait, to see the text echoed without the Enter.
+    /// Unix-only, same reasons as the count test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_text_submit_appends_enter() {
+        let srv = TuiServer::new();
+        srv.session_start(Parameters(StartArgs {
+            name: "catsess".into(),
+            command: "cat".into(),
+            args: vec![],
+            cwd: None,
+            env: HashMap::new(),
+            cols: None,
+            rows: None,
+            mode: Some("piped".into()),
+            buffer_bytes: None,
+        }))
+        .await
+        .unwrap();
+
+        let read_stdout = || {
+            srv.sessions
+                .with("catsess", |s| match s {
+                    Session::Piped(p) => Ok(p.read_stream(Stream::Stdout, false)),
+                    Session::Pty(_) => unreachable!("started as piped"),
+                })
+                .unwrap()
+        };
+
+        let fut = srv.send_text(Parameters(SendTextArgs {
+            name: "catsess".into(),
+            text: "hi".into(),
+            delay_ms: None,
+            submit: Some(true),
+        }));
+        tokio::pin!(fut);
+
+        // Poll once, racing a timer shorter than SUBMIT_WAIT_MS: the future
+        // writes the text and parks on its wait (see the `send_mouse` delay
+        // test for why `biased` and the pinned `&mut`).
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(std::time::Duration::from_millis((SUBMIT_WAIT_MS / 4).max(1))) => {}
+            _ = &mut fut => panic!("send_text returned before its submit wait elapsed"),
+        }
+
+        // cat echoes the text; the Enter cannot be written while the future
+        // is parked, so the buffer must hold the text alone.
+        let mut mid = String::new();
+        for _ in 0..40 {
+            mid = read_stdout();
+            if mid.contains("hi") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(mid, "hi");
+
+        let r = fut.await.unwrap();
+        let reply = r.content[0].as_text().map(|t| t.text.as_str());
+        assert_eq!(reply, Some("text sent, then Enter"));
+
+        let mut out = String::new();
+        for _ in 0..40 {
+            out = read_stdout();
+            if out.ends_with('\n') {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        srv.sessions.remove("catsess").ok();
+        assert_eq!(out, "hi\n");
     }
 
     /// With a non-zero `delay_ms`, `send_mouse` must emit the first click cycle,
@@ -1807,6 +2119,42 @@ mod tests {
     }
 
     #[test]
+    fn no_tool_parameter_publishes_a_null_default() {
+        // `#[serde(default)]` on an `Option` field makes schemars publish
+        // `"default": null`. Such a field must state its real default with
+        // `#[schemars(extend("default" = …))]`, or drop `#[serde(default)]` when
+        // it has no fixed default. `router()` includes the `dev-tools` tools when
+        // that feature is on.
+        for tool in TuiServer::router().list_all() {
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object());
+            for (param, schema) in props.into_iter().flatten() {
+                assert_ne!(
+                    schema.get("default"),
+                    Some(&serde_json::Value::Null),
+                    "{}.{param} publishes \"default\": null",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_default_comes_from_the_handler_constant() {
+        let tool = TuiServer::router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "wait_for_text")
+            .unwrap();
+        assert_eq!(
+            tool.input_schema["properties"]["timeout_ms"]["default"],
+            serde_json::json!(DEFAULT_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
     fn wait_return_deserializes_lowercase() {
         assert_eq!(
             serde_json::from_str::<WaitReturn>("\"none\"").unwrap(),
@@ -1831,5 +2179,178 @@ mod tests {
         let a: WaitTextArgs =
             serde_json::from_str(r#"{"name":"s","text":"Ready","format":"none"}"#).unwrap();
         assert_eq!(a.format, WaitReturn::None);
+    }
+
+    /// `signal`'s tool and parameter descriptions carry only the running
+    /// platform's text (built from `cfg_attr` doc lines).
+    #[test]
+    fn signal_description_is_per_platform() {
+        let tool = TuiServer::router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "signal")
+            .expect("signal is registered");
+        let desc = tool.description.as_deref().unwrap_or_default().to_string();
+        let param = tool.input_schema["properties"]["signal"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            desc.starts_with("Send a signal to a session's program."),
+            "{desc}"
+        );
+        if cfg!(unix) {
+            assert!(
+                desc.contains("USR2") && desc.contains("use STOP") && !desc.contains("Windows"),
+                "{desc}"
+            );
+            assert!(
+                param.starts_with("Signal name") && !param.contains("Windows"),
+                "{param}"
+            );
+        } else {
+            assert!(
+                desc.contains("types Ctrl+C") && !desc.contains("TSTP"),
+                "{desc}"
+            );
+            assert!(param.contains("Only \"INT\" works on Windows"), "{param}");
+        }
+    }
+
+    #[test]
+    fn resize_description_is_per_platform() {
+        let tool = TuiServer::router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "resize")
+            .expect("resize is registered");
+        let desc = tool.description.as_deref().unwrap_or_default().to_string();
+        assert!(desc.starts_with("Resize the terminal"), "{desc}");
+        assert_eq!(desc.contains("not reflowed"), cfg!(unix), "{desc}");
+    }
+
+    #[test]
+    fn signal_names_are_normalized() {
+        assert_eq!(normalize_signal("int"), Some("INT"));
+        assert_eq!(normalize_signal(" SIGterm "), Some("TERM"));
+        assert_eq!(normalize_signal("usr2"), Some("USR2"));
+        assert_eq!(normalize_signal("FOO"), None);
+        assert_eq!(normalize_signal("SIG"), None);
+    }
+}
+
+/// `signal` on Windows: INT types a raw 0x03 into a pty session, everything
+/// else is refused with a message naming what works.
+#[cfg(all(test, windows))]
+mod windows_signal_tests {
+    use super::*;
+
+    fn text(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect()
+    }
+
+    async fn start(srv: &TuiServer, name: &str, command: &str, args: &[&str], mode: &str) {
+        srv.session_start(Parameters(StartArgs {
+            name: name.into(),
+            command: command.into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            cwd: None,
+            env: HashMap::new(),
+            cols: None,
+            rows: None,
+            mode: Some(mode.into()),
+            buffer_bytes: None,
+        }))
+        .await
+        .expect("session_start");
+    }
+
+    async fn signal(srv: &TuiServer, name: &str, sig: &str) -> Result<CallToolResult, McpError> {
+        srv.signal(Parameters(SignalArgs {
+            name: name.into(),
+            signal: sig.into(),
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn int_interrupts_a_pty_program() {
+        // The server does this at startup; a test run from Git Bash would
+        // otherwise pass an inherited "ignore Ctrl+C" flag on to ping.
+        assert!(windows_ctrl_c::pass_to_children());
+        let srv = TuiServer::new();
+        start(&srv, "ping", "ping", &["-n", "30", "127.0.0.1"], "pty").await;
+        // Wait until ping is running and printing, so the Ctrl+C reaches it.
+        let mut started = false;
+        for _ in 0..100 {
+            let screen = srv
+                .sessions
+                .with("ping", |s| match s {
+                    Session::Pty(p) => Ok(p.dump(ScreenFormat::Text).text),
+                    Session::Piped(_) => unreachable!("started as pty"),
+                })
+                .unwrap();
+            if screen.contains("127.0.0.1") {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if !started {
+            srv.sessions.remove("ping").ok();
+            panic!("ping printed nothing within 5 s");
+        }
+
+        let r = signal(&srv, "ping", "SIGINT").await.expect("signal INT");
+        assert!(
+            text(&r).starts_with("typed Ctrl+C (byte 0x03)"),
+            "{}",
+            text(&r)
+        );
+        let r = srv
+            .wait_for_exit(Parameters(WaitExitArgs {
+                name: "ping".into(),
+                timeout_ms: Some(5000),
+            }))
+            .await
+            .expect("wait_for_exit");
+        srv.sessions.remove("ping").ok();
+        assert!(text(&r).starts_with("exited: "), "{}", text(&r));
+    }
+
+    #[tokio::test]
+    async fn other_signals_piped_sessions_and_exited_programs_are_refused() {
+        let srv = TuiServer::new();
+        start(&srv, "pty", "ping", &["-n", "30", "127.0.0.1"], "pty").await;
+        start(&srv, "piped", "ping", &["-n", "30", "127.0.0.1"], "piped").await;
+        start(&srv, "done", "cmd.exe", &["/c", "exit 0"], "pty").await;
+        srv.wait_for_exit(Parameters(WaitExitArgs {
+            name: "done".into(),
+            timeout_ms: Some(5000),
+        }))
+        .await
+        .expect("wait_for_exit");
+
+        let term = signal(&srv, "pty", "TERM").await.unwrap_err().message;
+        let unknown = signal(&srv, "pty", "FOO").await.unwrap_err().message;
+        let piped = signal(&srv, "piped", "INT").await.unwrap_err().message;
+        let done = signal(&srv, "done", "INT").await.unwrap_err().message;
+        for name in ["pty", "piped", "done"] {
+            srv.sessions.remove(name).ok();
+        }
+
+        assert!(
+            term.contains("TERM is not supported on Windows") && term.contains("INT"),
+            "{term}"
+        );
+        assert_eq!(unknown, "unknown signal 'FOO'");
+        assert!(
+            piped.contains("piped session cannot be interrupted"),
+            "{piped}"
+        );
+        assert!(done.contains("already exited"), "{done}");
     }
 }

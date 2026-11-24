@@ -102,6 +102,26 @@ pub fn key_to_bytes(name: &str, mods: Mods) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Translate a named key into bytes for a piped session (no terminal).
+/// Same as `key_to_bytes`, except Enter.
+pub fn piped_key_to_bytes(name: &str, mods: Mods) -> Option<Vec<u8>> {
+    match name.to_ascii_lowercase().as_str() {
+        // A piped program reads lines, and a line ends in `\n`. The `\r` a
+        // terminal's Enter sends becomes `\n` only through a tty's line
+        // discipline (ICRNL), which pipes don't have, so it never completes a
+        // line there. Modifiers are ignored, as in `key_to_bytes`.
+        //
+        // Intentionally `\n` on Windows too, not the Windows-specific `\r\n`:
+        // Windows line readers (C runtime text mode, Python, .NET `ReadLine`,
+        // cmd's `set /p`) accept a bare `\n`, while `\r\n` would leave a stray
+        // `\r` in Unix-born programs started piped from Windows (Git Bash,
+        // WSL). If a Windows program turns out to need it, switch to `\r\n`
+        // on Windows here. `cr` still sends `\r`.
+        "enter" | "return" => Some(vec![b'\n']),
+        _ => key_to_bytes(name, mods),
+    }
+}
+
 /// F1-F4 without mods use SS3 (`ESC O P` etc.); with mods use the CSI form.
 fn csi_ss3_or_mod(final_byte: u8, mods: Mods) -> Vec<u8> {
     if mods.any() {
@@ -271,6 +291,22 @@ mod tests {
             Some(vec![0x1b, b'[', b'A'])
         );
         assert_eq!(key_to_bytes("backspace", Mods::default()), Some(vec![0x7f]));
+    }
+
+    #[test]
+    fn piped_enter_ends_a_line_and_cr_stays_cr() {
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        for name in ["enter", "Return"] {
+            assert_eq!(piped_key_to_bytes(name, Mods::default()), Some(vec![b'\n']));
+            assert_eq!(piped_key_to_bytes(name, shift), Some(vec![b'\n']));
+        }
+        assert_eq!(piped_key_to_bytes("cr", Mods::default()), Some(vec![b'\r']));
+        // Every other key is encoded as in a terminal.
+        assert_eq!(piped_key_to_bytes("up", shift), key_to_bytes("up", shift));
+        assert_eq!(piped_key_to_bytes("nope", shift), None);
     }
 
     #[test]
